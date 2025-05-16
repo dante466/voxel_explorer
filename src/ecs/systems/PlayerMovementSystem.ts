@@ -12,50 +12,135 @@ const JUMP_VELOCITY = 7.0; // meters/second
 const GRAVITY = 20.0; // meters/second^2
 const DEFAULT_TERRAIN_HEIGHT = 64; // From ChunkManager
 
+// Interface for the input state to the movement calculation logic
+export interface PlayerMovementInputState {
+  currentPosition: THREE.Vector3;
+  currentYVelocity: number;
+  currentIsFlying: boolean;
+  cameraYaw: number;
+  keys: { [key: string]: boolean }; // Key states relevant for movement (W,A,S,D,Space,Shift)
+  deltaTime: number;
+  chunkManager: ChunkManager;
+}
+
+// Interface for the output state from the movement calculation logic
+export interface PlayerMovementOutputState {
+  newPosition: THREE.Vector3;
+  newYVelocity: number;
+  // newIsFlying is not returned here; flying state is toggled by a separate action
+}
+
+// Extracted core movement logic
+export function calculatePlayerMovement(input: PlayerMovementInputState): PlayerMovementOutputState {
+  const { currentPosition, currentYVelocity, currentIsFlying, cameraYaw, keys, deltaTime, chunkManager } = input;
+  
+  const newPos = currentPosition.clone();
+  let newYVel = currentYVelocity;
+
+  const moveDirection = new THREE.Vector3(0, 0, 0);
+
+  if (keys['KeyW'] || keys['ArrowUp']) {
+    moveDirection.z -= 1;
+  }
+  if (keys['KeyS'] || keys['ArrowDown']) {
+    moveDirection.z += 1;
+  }
+  if (keys['KeyA'] || keys['ArrowLeft']) {
+    moveDirection.x -= 1;
+  }
+  if (keys['KeyD'] || keys['ArrowRight']) {
+    moveDirection.x += 1;
+  }
+
+  if (moveDirection.lengthSq() > 0) {
+    moveDirection.normalize();
+    moveDirection.applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraYaw);
+  }
+
+  const speed = currentIsFlying ? PLAYER_SPEED_FLYING : PLAYER_SPEED_GROUND;
+  const deltaX = moveDirection.x * speed * deltaTime;
+  const deltaZ = moveDirection.z * speed * deltaTime;
+  let deltaY = 0;
+
+  newPos.x += deltaX;
+  newPos.z += deltaZ;
+
+  if (currentIsFlying) {
+    newYVel = 0; // Reset gravity effect while flying
+    if (keys['Space']) {
+      deltaY = speed * deltaTime;
+      newPos.y += deltaY;
+    }
+    if (keys['ShiftLeft'] || keys['ControlLeft']) {
+      deltaY = -speed * deltaTime;
+      newPos.y += deltaY;
+    }
+  } else {
+    const terrainHeight = chunkManager.getHeightAtPosition(newPos.x, newPos.z);
+
+    if (terrainHeight === DEFAULT_TERRAIN_HEIGHT) {
+      deltaY = newYVel * deltaTime;
+      newPos.y += deltaY;
+    } else {
+      const targetPlayerYOnGround = terrainHeight + FPS_EYE_HEIGHT;
+      const isOnGround = newPos.y <= targetPlayerYOnGround + 0.1 && newYVel <= 0;
+
+      if (keys['Space'] && isOnGround) {
+        newYVel = JUMP_VELOCITY;
+      }
+
+      newYVel -= GRAVITY * deltaTime;
+      deltaY = newYVel * deltaTime;
+      newPos.y += deltaY;
+
+      if (newPos.y < targetPlayerYOnGround) {
+        newPos.y = targetPlayerYOnGround;
+        newYVel = 0;
+      }
+    }
+  }
+  return { newPosition: newPos, newYVelocity: newYVel };
+}
+
 export interface PlayerMovementSystemControls {
   system: System;
   cleanup: () => void;
   isFlying: () => boolean;
   toggleFlying: () => void;
+  // Expose keyStates for NetworkManager to capture for pending inputs
+  getKeyStates: () => { [key: string]: boolean }; 
 }
 
-// Temporary PlayerInput component to store key states
-// In a more complex setup, this might come from a dedicated InputSystem that writes to an Input component
 const keyStates: { [key: string]: boolean } = {};
 
 export function createPlayerMovementSystem(
   world: IWorld,
   playerEntityId: number,
-  gameDocument: Document, // For key listeners
-  chunkManager: ChunkManager // Added chunkManager parameter
+  gameDocument: Document,
+  chunkManager: ChunkManager
 ): PlayerMovementSystemControls {
-  let currentIsFlying = true; // Default to flying
-  let yVelocity = 0; // For gravity and jumping
+  let currentIsFlying = true;
+  let yVelocity = 0;
 
   const onKeyDown = (event: KeyboardEvent) => {
-    console.log(`PlayerMovementSystem: onKeyDown - ${event.code}`); // DEBUG LOG
-    
-    // Prevent default browser actions for game keys
     const gameKeys = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'ShiftLeft', 'ControlLeft', 'KeyF', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
     if (gameKeys.includes(event.code)) {
       event.preventDefault();
     }
-
     keyStates[event.code] = true;
-    if (event.code === 'KeyF') { // Toggle flying with F key
+    if (event.code === 'KeyF') {
       toggleFlyingLocal();
     }
   };
   const onKeyUp = (event: KeyboardEvent) => {
-    console.log(`PlayerMovementSystem: onKeyUp - ${event.code}`); // DEBUG LOG
     keyStates[event.code] = false;
   };
 
-  console.log('PlayerMovementSystem: Adding key listeners to document.'); // DEBUG LOG
   gameDocument.addEventListener('keydown', onKeyDown);
   gameDocument.addEventListener('keyup', onKeyUp);
 
   const playerQuery = defineQuery([Transform, CameraTarget]);
+  const tempCurrentPosition = new THREE.Vector3(); // For passing to calculatePlayerMovement
 
   const movementSystem = defineSystem((currentWorld: IWorld, delta: number) => {
     const entities = playerQuery(currentWorld);
@@ -63,97 +148,38 @@ export function createPlayerMovementSystem(
 
     const eid = playerEntityId;
 
-    console.log('PlayerMovementSystem: keyStates:', JSON.stringify(keyStates)); // UNCOMMENTED
+    // Prepare input for calculatePlayerMovement
+    tempCurrentPosition.set(Transform.position.x[eid], Transform.position.y[eid], Transform.position.z[eid]);
+    const inputState: PlayerMovementInputState = {
+      currentPosition: tempCurrentPosition,
+      currentYVelocity: yVelocity,
+      currentIsFlying: currentIsFlying,
+      cameraYaw: CameraTarget.yaw[eid],
+      keys: { ...keyStates }, // Pass a copy of relevant key states
+      deltaTime: delta,
+      chunkManager: chunkManager,
+    };
 
-    const moveDirection = new THREE.Vector3(0, 0, 0);
-    const cameraYaw = CameraTarget.yaw[eid]; // Get current yaw from CameraTarget
+    const outputState = calculatePlayerMovement(inputState);
 
-    // Forward/Backward (W/S) movement based on player yaw
-    if (keyStates['KeyW'] || keyStates['ArrowUp']) {
-      moveDirection.z -= 1;
-    }
-    if (keyStates['KeyS'] || keyStates['ArrowDown']) {
-      moveDirection.z += 1;
-    }
-    // Left/Right (A/D) strafe movement based on player yaw
-    if (keyStates['KeyA'] || keyStates['ArrowLeft']) {
-      moveDirection.x -= 1;
-    }
-    if (keyStates['KeyD'] || keyStates['ArrowRight']) {
-      moveDirection.x += 1;
-    }
+    // Update ECS Transform component
+    Transform.position.x[eid] = outputState.newPosition.x;
+    Transform.position.y[eid] = outputState.newPosition.y;
+    Transform.position.z[eid] = outputState.newPosition.z;
 
-    if (moveDirection.lengthSq() > 0) {
-      console.log('PlayerMovementSystem: moveDirection (raw):', moveDirection.x, moveDirection.y, moveDirection.z); // UNCOMMENTED
-    }
+    // Update internal state for next frame
+    yVelocity = outputState.newYVelocity;
+    // currentIsFlying is updated by toggleFlyingLocal directly
+    
+    // Optional: Log position changes (already existed in original code)
+    // if (outputState.newPosition.distanceToSquared(tempCurrentPosition) > 0.0001) {
+    //   console.log(`PlayerMovementSystem: PosChange ... NewPos X:${Transform.position.x[eid].toFixed(2)}, Y:${Transform.position.y[eid].toFixed(2)}, Z:${Transform.position.z[eid].toFixed(2)}`);
+    // }
 
-    if (moveDirection.lengthSq() > 0) {
-      moveDirection.normalize();
-      // Apply yaw to the horizontal movement direction
-      moveDirection.applyAxisAngle(new THREE.Vector3(0, 1, 0), cameraYaw);
-      console.log('PlayerMovementSystem: moveDirection (final):', moveDirection.x, moveDirection.y, moveDirection.z); // UNCOMMENTED
-    }
-
-    const speed = currentIsFlying ? PLAYER_SPEED_FLYING : PLAYER_SPEED_GROUND;
-    const deltaX = moveDirection.x * speed * delta;
-    const deltaZ = moveDirection.z * speed * delta;
-    let deltaY = 0;
-
-    Transform.position.x[eid] += deltaX;
-    Transform.position.z[eid] += deltaZ;
-
-    if (currentIsFlying) {
-      yVelocity = 0; // Reset gravity effect while flying
-      if (keyStates['Space']) {
-        deltaY = speed * delta;
-        Transform.position.y[eid] += deltaY;
-      }
-      if (keyStates['ShiftLeft'] || keyStates['ControlLeft']) {
-        deltaY = -speed * delta;
-        Transform.position.y[eid] += deltaY;
-      }
-    } else {
-      const currentX = Transform.position.x[eid];
-      const currentZ = Transform.position.z[eid];
-      const terrainHeight = chunkManager.getHeightAtPosition(currentX, currentZ);
-      console.log(`PlayerMovementSystem: Ground Mode - currentY: ${Transform.position.y[eid].toFixed(2)}, terrainHeight: ${terrainHeight}, yVelocity: ${yVelocity.toFixed(2)}`); // UNCOMMENTED
-
-      // If terrain height is the default, assume chunk is not fully loaded for physics.
-      // Keep player from falling through by effectively acting as if still flying for this frame regarding Y-axis.
-      if (terrainHeight === DEFAULT_TERRAIN_HEIGHT) {
-        // Maintain current yVelocity (which should be 0 if previously flying or reset by toggle)
-        // or if player was falling, let them continue based on previous frame's non-default height.
-        // Effectively, don't apply new gravity or floor collision based on default height.
-        deltaY = yVelocity * delta;
-        Transform.position.y[eid] += deltaY; // Apply existing momentum if any
-        // (Optional: Could revert to currentIsFlying = true temporarily, but that has other side effects)
-      } else {
-        const targetPlayerYOnGround = terrainHeight + FPS_EYE_HEIGHT;
-        const isOnGround = Transform.position.y[eid] <= targetPlayerYOnGround + 0.1 && yVelocity <= 0;
-
-        if (keyStates['Space'] && isOnGround) {
-          yVelocity = JUMP_VELOCITY;
-        }
-
-        yVelocity -= GRAVITY * delta;
-        deltaY = yVelocity * delta;
-        Transform.position.y[eid] += deltaY;
-
-        if (Transform.position.y[eid] < targetPlayerYOnGround) {
-          Transform.position.y[eid] = targetPlayerYOnGround;
-          deltaY = targetPlayerYOnGround - (Transform.position.y[eid] - deltaY); // Recalculate actual deltaY
-          yVelocity = 0;
-        }
-      }
-    }
-    if (deltaX !== 0 || deltaY !== 0 || deltaZ !== 0) { // UNCOMMENTED BLOCK
-       console.log(`PlayerMovementSystem: PosChange dX:${deltaX.toFixed(2)}, dY:${deltaY.toFixed(2)}, dZ:${deltaZ.toFixed(2)}. NewPos X:${Transform.position.x[eid].toFixed(2)}, Y:${Transform.position.y[eid].toFixed(2)}, Z:${Transform.position.z[eid].toFixed(2)}`);
-    }
     return currentWorld;
   });
 
   const cleanup = () => {
-    console.log('PlayerMovementSystem: Removing key listeners from document.'); // DEBUG LOG
     gameDocument.removeEventListener('keydown', onKeyDown);
     gameDocument.removeEventListener('keyup', onKeyUp);
     console.log('PlayerMovementSystem cleaned up listeners.');
@@ -163,7 +189,6 @@ export function createPlayerMovementSystem(
     currentIsFlying = !currentIsFlying;
     yVelocity = 0; // Reset velocity when changing mode
     console.log(`PlayerMovementSystem: Flying mode ${currentIsFlying ? 'enabled' : 'disabled'}`);
-    // Update external state if needed (e.g., UI toggle in main.tsx)
     const flyingToggleInput = gameDocument.getElementById('flyingToggle') as HTMLInputElement;
     if (flyingToggleInput) flyingToggleInput.checked = currentIsFlying;
   };
@@ -173,5 +198,6 @@ export function createPlayerMovementSystem(
     cleanup,
     isFlying: () => currentIsFlying,
     toggleFlying: toggleFlyingLocal,
+    getKeyStates: () => ({ ...keyStates }), // Return a copy
   };
 } 

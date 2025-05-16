@@ -8,6 +8,8 @@ export interface ClientCommand {
   mouseX: number;
   mouseY: number;
   timestamp: number;
+  seq?: number;
+  type?: string;
 }
 
 export interface ConnectionState {

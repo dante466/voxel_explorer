@@ -1,8 +1,12 @@
+import { WebSocket } from 'ws';
+
 export interface Player {
   id: string;
   position: { x: number; y: number; z: number };
   rotation: { x: number; y: number; z: number };
   velocity: { x: number; y: number; z: number };
+  lastProcessedInputSeq?: number;
+  ws?: WebSocket;
 }
 
 export interface Chunk {

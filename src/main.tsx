@@ -19,7 +19,7 @@ import {
 import { CameraMode } from './ecs/types';
 import { createInputLookSystem } from './ecs/systems/inputLookSystem';
 import { createTransformSystem, addObject3DToEntity, object3DMap } from './ecs/systems/transformSystem';
-import { createPlayerMovementSystem, type PlayerMovementSystemControls } from './ecs/systems/PlayerMovementSystem';
+import { createPlayerMovementSystem, type PlayerMovementSystemControls } from './ecs/systems/playerMovementSystem';
 import { addEntity, addComponent, hasComponent } from 'bitecs';
 import { type System as BitecsSystem, type IWorld } from 'bitecs';
 import { Object3DRef } from './ecs/systems/transformSystem';
@@ -516,8 +516,14 @@ if (debugMode) {
   document.body.appendChild(stats.dom);
 }
 
-// Initialize network manager - NOW PASSES world and playerEntity
-const networkManager = new NetworkManager('ws://localhost:8080', world, playerEntity);
+// Initialize network manager
+const networkManager = new NetworkManager(
+  'ws://localhost:3000', // Changed port to 3000 to match server
+  world, 
+  playerEntity, 
+  movementSystemControls, // Pass PlayerMovementSystemControls
+  chunkManager // Pass ChunkManager
+);
 networkManager.connect();
 
 // Handle window resize - NEW CAMERA SYSTEM HANDLES ITS OWN RESIZE

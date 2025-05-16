@@ -1,7 +1,7 @@
-import express from 'express';
+import * as express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createPhysicsWorld, initRapier } from './physics.js';
-import type { MatchState } from './types.js';
+import type { MatchState, Player } from './types.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -29,13 +29,27 @@ async function startServer() {
     lastUpdate: Date.now()
   };
 
+  let nextPlayerId = 1; // Simple ID generator
+
   // WebSocket connection handler
   wss.on('connection', (ws) => {
-    console.log('New client connected');
+    const playerId = `player${nextPlayerId++}`;
+    console.log(`New client connected. Assigned ID: ${playerId}`);
 
-    // Send initial state
+    const newPlayer: Player = {
+      id: playerId,
+      position: { x: 0, y: 70, z: 0 }, // Default spawn position
+      rotation: { x: 0, y: 0, z: 0 }, // Default spawn rotation (should be quaternion)
+      velocity: { x: 0, y: 0, z: 0 },
+      ws: ws, // Associate WebSocket with player
+      lastProcessedInputSeq: 0 // Initialize
+    };
+    matchState.players.set(playerId, newPlayer);
+
+    // Send initial state (now includes the new player)
     ws.send(JSON.stringify({
       type: 'init',
+      playerId: playerId, // Send the client its ID
       state: matchState
     }));
 
@@ -65,9 +79,38 @@ async function startServer() {
       case 'chunkRequest':
         // TODO: Send chunk data
         break;
+      case 'clientCommand': 
+        const cmdPlayerId = getPlayerIdForWebSocket(ws);
+        if (cmdPlayerId) {
+          const player = matchState.players.get(cmdPlayerId);
+          if (player && message.seq !== undefined) { // Ensure seq is present
+            // console.log(`Received clientCommand from player ${cmdPlayerId}, seq: ${message.seq}:`, message);
+            player.lastProcessedInputSeq = message.seq;
+            // TODO: Process the rest of message (movement, actions etc.) to update player state in physics
+            // Example: player.inputQueue.push(message); // or apply to physics representation directly
+          } else if (!player) {
+            console.warn(`Received clientCommand for known player ID ${cmdPlayerId} but player not found in state.`);
+          } else if (message.seq === undefined) {
+            console.warn(`Received clientCommand from player ${cmdPlayerId} without sequence number.`);
+          }
+        } else {
+          // This should ideally not happen if player is registered on connection
+          console.warn('Received clientCommand but could not identify player from WebSocket connection.');
+        }
+        break;
       default:
-        console.warn('Unknown message type:', message.type);
+        console.warn(`Unknown message type received: '${message.type}'`); // Clarified log
     }
+  }
+
+  // Helper function placeholder - you'll need to implement actual player session management
+  function getPlayerIdForWebSocket(ws: WebSocket): string | null {
+    for (const [id, player] of matchState.players.entries()) {
+      if (player.ws === ws) {
+        return id;
+      }
+    }
+    return null; // Player not found for this WebSocket connection
   }
 
   // Game loop
