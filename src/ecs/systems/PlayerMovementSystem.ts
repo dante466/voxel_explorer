@@ -3,7 +3,7 @@ import type { IWorld } from 'bitecs';
 import * as THREE from 'three';
 import { Transform } from '../world';
 import { CameraTarget } from '../components/CameraTarget';
-import { FPS_EYE_HEIGHT } from './cameraSystem';
+import { FPS_EYE_HEIGHT } from './CameraSystem';
 import { type ChunkManager } from '../../world/ChunkManager';
 
 const PLAYER_SPEED_GROUND = 5.0; // meters/second

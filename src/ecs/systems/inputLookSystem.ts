@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import { CameraTarget } from '../components/CameraTarget';
 import { CameraMode } from '../types';
 // Import zoom constants from cameraSystem
-import { ZOOM_MIN, ZOOM_MAX, DEFAULT_ZOOM } from './cameraSystem';
+import { ZOOM_MIN, ZOOM_MAX, DEFAULT_ZOOM } from './CameraSystem';
 
 const MOUSE_SENSITIVITY_X = 0.002;
 const MOUSE_SENSITIVITY_Y = 0.002; // Can be different if needed, e.g. for inversion

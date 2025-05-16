@@ -4,7 +4,7 @@ import type { ClientCommand } from './types';
 import type { IWorld } from 'bitecs'; // Import IWorld
 import { Transform } from '../ecs/world'; // Import Transform component
 import { CameraTarget } from '../ecs/components/CameraTarget'; // For cameraYaw
-import { calculatePlayerMovement, type PlayerMovementInputState, type PlayerMovementOutputState, type PlayerMovementSystemControls } from '../ecs/systems/playerMovementSystem'; // For replaying inputs
+import { calculatePlayerMovement, type PlayerMovementInputState, type PlayerMovementOutputState, type PlayerMovementSystemControls } from '../ecs/systems/PlayerMovementSystem'; // For replaying inputs
 import { type ChunkManager } from '../world/ChunkManager'; // Required by calculatePlayerMovement
 import * as THREE from 'three'; // For THREE.Vector3 in reconciliation
 // import * as THREE from 'three'; // THREE is no longer directly used for camera

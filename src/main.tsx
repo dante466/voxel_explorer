@@ -15,14 +15,16 @@ import {
   type CameraSystemControls,
   FPS_EYE_HEIGHT,
   DEFAULT_ZOOM,
-} from './ecs/systems/cameraSystem';
+} from './ecs/systems/CameraSystem';
 import { CameraMode } from './ecs/types';
 import { createInputLookSystem } from './ecs/systems/inputLookSystem';
 import { createTransformSystem, addObject3DToEntity, object3DMap } from './ecs/systems/transformSystem';
-import { createPlayerMovementSystem, type PlayerMovementSystemControls } from './ecs/systems/playerMovementSystem';
+import { createPlayerMovementSystem, type PlayerMovementSystemControls } from './ecs/systems/PlayerMovementSystem';
 import { addEntity, addComponent, hasComponent } from 'bitecs';
 import { type System as BitecsSystem, type IWorld } from 'bitecs';
 import { Object3DRef } from './ecs/systems/transformSystem';
+import { getMouseNDC, getPickingRay, raycastVoxel, getCenterScreenRay } from './utils/raycastVoxel';
+import { VoxelHighlighter } from './render/Highlight';
 
 // Player Model Constants
 const PLAYER_HEIGHT = 1.8; // meters
@@ -154,7 +156,9 @@ let lastCollisionChunkZ = -1;
 // Debug mode variables
 let isFlying = true; // This will be controlled by a new movement system later
 const flySpeed = 15.0; // This will be controlled by a new movement system later
-let showCollisionBoxes = false; // Show collision boxes by default - CHANGED TO FALSE
+let showCollisionBoxes = false;
+let showBlockHighlighter = true;
+let showCrosshair = true; // New state for crosshair toggle
 
 // Create admin menu
 const adminMenu = document.createElement('div');
@@ -181,23 +185,52 @@ menuContent.innerHTML = `
   </div>
   <div style="margin-bottom: 5px">
     <label style="display: flex; align-items: center; gap: 5px">
-      <input type="checkbox" id="collisionToggle" checked>
+      <input type="checkbox" id="collisionToggle">
       Show Collision Boxes
+    </label>
+  </div>
+  <div style="margin-bottom: 5px">
+    <label style="display: flex; align-items: center; gap: 5px">
+      <input type="checkbox" id="highlighterToggle" checked>
+      Show Block Highlighter (3D)
+    </label>
+  </div>
+  <div style="margin-bottom: 5px">
+    <label style="display: flex; align-items: center; gap: 5px">
+      <input type="checkbox" id="crosshairToggle" checked>
+      Show Crosshair (2D Dot)
     </label>
   </div>
 `;
 adminMenu.appendChild(menuContent);
 document.body.appendChild(adminMenu);
 
+// M4.1 - Create a crosshair element
+const crosshairElement = document.createElement('div');
+crosshairElement.style.position = 'fixed'; // Use fixed to ensure it's relative to viewport
+crosshairElement.style.left = '50%';
+crosshairElement.style.top = '50%';
+crosshairElement.style.width = '6px'; // Small dot
+crosshairElement.style.height = '6px';
+crosshairElement.style.backgroundColor = 'red';
+crosshairElement.style.borderRadius = '50%'; // Make it a circle
+crosshairElement.style.transform = 'translate(-50%, -50%)'; // Center it precisely
+crosshairElement.style.zIndex = '1001'; // Ensure it's above admin menu and game canvas
+crosshairElement.style.pointerEvents = 'none'; // Prevent it from interfering with mouse events
+crosshairElement.style.display = showCrosshair ? 'block' : 'none'; // Initial visibility based on new state
+document.body.appendChild(crosshairElement);
+
 // Add event listeners for toggles
 const flyingToggle = document.getElementById('flyingToggle') as HTMLInputElement;
 const collisionToggle = document.getElementById('collisionToggle') as HTMLInputElement;
+const highlighterToggle = document.getElementById('highlighterToggle') as HTMLInputElement;
+const crosshairToggle = document.getElementById('crosshairToggle') as HTMLInputElement; // New toggle element
 
-// Ensure admin UI flying toggle is in sync with PlayerMovementSystem state initially
+// Ensure admin UI toggles are in sync with initial states
 if (flyingToggle) flyingToggle.checked = movementSystemControls.isFlying();
-
-// Ensure admin UI collision toggle is in sync with showCollisionBoxes state initially
-if (collisionToggle) collisionToggle.checked = showCollisionBoxes; // ADDED THIS LINE
+if (collisionToggle) collisionToggle.checked = showCollisionBoxes;
+if (highlighterToggle) highlighterToggle.checked = showBlockHighlighter;
+if (crosshairToggle) crosshairToggle.checked = showCrosshair; 
 
 flyingToggle.addEventListener('change', (e) => {
   const isChecked = (e.target as HTMLInputElement).checked;
@@ -232,6 +265,27 @@ collisionToggle.addEventListener('change', (e) => {
     // And ensure all relevant cached meshes are made visible on next update
     // (updateCollisionVisualization will handle this)
   }
+});
+
+highlighterToggle.addEventListener('change', (e) => {
+  const isChecked = (e.target as HTMLInputElement).checked;
+  showBlockHighlighter = isChecked;
+  if (!isChecked) {
+    // Explicitly hide the 3D wireframe highlighter immediately when its toggle is unchecked.
+    if (voxelHighlighter) { // Ensure voxelHighlighter is initialized
+        voxelHighlighter.update(null);
+    }
+  }
+  console.debug(`Block highlighter (3D) ${showBlockHighlighter ? 'enabled' : 'disabled'}`);
+});
+
+// Event listener for the new crosshair toggle
+crosshairToggle.addEventListener('change', (e) => {
+  showCrosshair = (e.target as HTMLInputElement).checked;
+  if (crosshairElement) { // Ensure crosshairElement is initialized
+    crosshairElement.style.display = showCrosshair ? 'block' : 'none';
+  }
+  console.debug(`Crosshair (2D Dot) ${showCrosshair ? 'enabled' : 'disabled'}`);
 });
 
 // Function to check if a point is in view frustum - uses gameCamera now
@@ -533,34 +587,62 @@ networkManager.connect();
 //   renderer.setSize(window.innerWidth, window.innerHeight);
 // });
 
+// M4.1: Initialize Voxel Highlighter
+const voxelHighlighter = new VoxelHighlighter(scene);
+const MAX_RAYCAST_DISTANCE = 100; // Max distance for voxel picking
+
+// M4.1 - Function to update center-screen voxel highlight (called in animate loop)
+function updateCenterScreenVoxelHighlight() {
+  if (!gameCamera || !chunkManager || !voxelHighlighter) return; // Guard against uninitialized objects
+
+  if (!showBlockHighlighter) { 
+    voxelHighlighter.update(null); // Ensure 3D highlight is off if state var is false
+    return;
+  }
+  
+  // If showBlockHighlighter is true, proceed with raycasting and updating.
+  const pickRay = getCenterScreenRay(gameCamera);
+  const result = raycastVoxel(pickRay.origin, pickRay.direction, chunkManager, MAX_RAYCAST_DISTANCE);
+  
+  if (result) {
+    voxelHighlighter.update(result.position);
+    if (debugMode) { 
+        console.log('Center Target Voxel Coords:', result.voxel, 'Normal:', result.normal, 'Distance:', result.distance);
+    }
+  } else {
+    voxelHighlighter.update(null);
+  }
+}
+
 // Animation loop
 const clock = new THREE.Clock();
-// ... existing code ...
 function animate() {
   requestAnimationFrame(animate);
   stats?.begin();
   
   const delta = clock.getDelta();
 
-    // --- NEW SYSTEM CALLS ---
-    inputLookSystemInstance(world);
-    playerMovementSystem(world, delta);
-    cameraSystemManager.system(world);
-    transformSystem(world);
+  // --- ECS SYSTEM CALLS ---
+  inputLookSystemInstance(world);
+  playerMovementSystem(world, delta);
+  cameraSystemManager.system(world);
+  transformSystem(world);
 
-    // Update ChunkManager with player's ECS position
-    const playerWorldX = Transform.position.x[playerEntity];
-    const playerWorldZ = Transform.position.z[playerEntity];
-    chunkManager.update(playerWorldX, playerWorldZ, scene, true); // Consider if gameCamera needs to be passed for culling
+  // Update ChunkManager with player's ECS position
+  const playerWorldX = Transform.position.x[playerEntity];
+  const playerWorldZ = Transform.position.z[playerEntity];
+  chunkManager.update(playerWorldX, playerWorldZ, scene, true);
 
-    // Update collision visualization (if shown) with player's ECS position
-    if (showCollisionBoxes) {
-      const playerPosVec3 = new THREE.Vector3(playerWorldX, Transform.position.y[playerEntity], playerWorldZ);
-      updateCollisionVisualization(playerPosVec3, gameCamera);
-    }
+  // M4.1 - Update center screen voxel highlight each frame
+  updateCenterScreenVoxelHighlight();
+
+  // Update collision visualization (if shown)
+  if (showCollisionBoxes) {
+    const playerPosVec3 = new THREE.Vector3(playerWorldX, Transform.position.y[playerEntity], playerWorldZ);
+    updateCollisionVisualization(playerPosVec3, gameCamera);
+  }
     
-    // lastCameraPosition.copy(camera.position); // OLD
-  renderer.render(scene, gameCamera); // USE NEW gameCamera
+  renderer.render(scene, gameCamera);
   stats?.end();
 }
 
@@ -592,4 +674,9 @@ window.addEventListener('unload', () => {
     if (mesh.parent) mesh.parent.remove(mesh);
   });
   collisionMeshCache.clear();
+
+  // In cleanupGame or window unload, ensure crosshair is removed if needed
+  if (crosshairElement && crosshairElement.parentNode) {
+    crosshairElement.parentNode.removeChild(crosshairElement);
+  }
 }); 

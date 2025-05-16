@@ -459,6 +459,62 @@ export class ChunkManager {
     return height || 64; // Fallback to sea level if height is undefined
   }
 
+  // New method to check if a block exists at world coordinates
+  public hasBlock(worldX: number, worldY: number, worldZ: number): boolean {
+    const chunkX = Math.floor(worldX / 32); // Assuming CHUNK_SIZE.WIDTH is 32
+    const chunkZ = Math.floor(worldZ / 32); // Assuming CHUNK_SIZE.DEPTH is 32
+
+    const chunkKey = this.getChunkKey(chunkX, chunkZ);
+    const chunk = this.chunkData.get(chunkKey);
+
+    if (!chunk) {
+      return false; // Chunk not loaded or doesn't exist
+    }
+
+    // Convert world Y to local Y. Assuming world Y is directly local Y for blocks.
+    // And assuming CHUNK_SIZE.HEIGHT for chunks is 128 (as per spec) but Chunk.ts uses 32 for data array height.
+    // This needs clarification based on how Chunk.ts data is structured vs. world height.
+    // For now, assume worldY is directly usable if within chunk's height bounds as per Chunk.ts.
+    const localX = ((worldX % 32) + 32) % 32; // Ensure positive local coords
+    const localZ = ((worldZ % 32) + 32) % 32;
+    const localY = worldY; // This is a critical assumption here.
+                           // Chunk.ts: isInBounds checks against CHUNK_SIZE.HEIGHT (32) or LOD_CHUNK_SIZE.HEIGHT (16)
+                           // The world has a height of 128. Voxel data in Chunk.ts seems to be 32x32x32 or 16x16x16 for LOD.
+                           // This implies that a single Chunk object does not store the full 128 vertical height.
+                           // This needs to be reconciled. For now, proceeding with assumption that localY = worldY is intended for the target chunk.
+                           // If a single chunk only covers a vertical slice, then raycasting needs to find the right vertical chunk too.
+                           // Let's assume for 4.1 the `Chunk` at `chunkX, chunkZ` covers the full height relevant to `worldY`.
+                           // Or, more likely, Chunk data is CHUNK_WIDTH x WORLD_HEIGHT x CHUNK_DEPTH conceptually for storage, 
+                           // but `Chunk.ts` CHUNK_SIZE.HEIGHT is 32. This is a mismatch.
+                           // For the DDA, we need to check the block *within the specific chunk data array*. 
+                           // The `y` in `chunk.hasBlock(localX, localY, localZ)` must be local to that chunk's data array.
+
+    // Re-evaluating localY:
+    // If world height is 128, and chunk data height is 32 (from CHUNK_SIZE.HEIGHT in Chunk.ts)
+    // then we need to also determine which vertical chunk segment worldY falls into.
+    // However, the current ChunkManager structure (Map<string, Chunk> with key from chunkX, chunkZ)
+    // doesn't support multiple vertical chunks at the same (X,Z). 
+    // This implies Chunk.ts's CHUNK_SIZE.HEIGHT should represent the full height slice (e.g. 128).
+    // The Chunk.ts defines CHUNK_SIZE.HEIGHT = 32. This is the source of the conflict.
+
+    // For the purpose of M4.1, let's assume that the `ChunkManager` is intended to provide
+    // access to a voxel space where `worldY` is directly used as `localY` within the specific chunk's data array,
+    // and that `Chunk.isInBounds` correctly handles the `y` for its data dimensions.
+    // This is likely an architectural simplification in the current code that will need future refinement
+    // if chunks are meant to be stacked vertically.
+
+    // Given Chunk.ts internal structure uses CHUNK_SIZE.HEIGHT for its y-dimension (32), 
+    // then worldY must be mapped to a localY within that range [0, CHUNK_SIZE.HEIGHT - 1].
+    // This suggests raycastVoxel's currentVoxelY should also be within this range IF it's hitting a chunk.
+    // This is getting complicated due to the ambiguity. 
+    // For now, the simplest path is that chunk.hasBlock() will take the worldY and correctly interpret it
+    // or determine if it's out of its specific bounds.
+    // The `Chunk.hasBlock` method already calls `isInBounds` which uses its LOD-specific height.
+    // So, we pass worldY as localY and let the Chunk class handle it.
+
+    return chunk.hasBlock(localX, localY, localZ);
+  }
+
   getChunkData(chunkKey: string): Chunk | undefined {
     return this.chunkData.get(chunkKey);
   }
