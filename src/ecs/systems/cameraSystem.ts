@@ -1,89 +1,254 @@
-import { defineQuery, defineSystem } from 'bitecs';
+import { defineQuery, defineSystem, type System } from 'bitecs';
 import type { IWorld } from 'bitecs';
-import { PerspectiveCamera, Vector3 } from 'three';
+import * as THREE from 'three';
+import { CameraTarget } from '../components/CameraTarget';
 import { Transform } from '../world';
-import { Camera, CameraTarget } from '../components/camera';
-import { Object3DRef, object3DMap } from './transformSystem';
+import { CameraMode } from '../types';
+import type { ChunkManager } from '../../world/ChunkManager';
+// object3DMap might be used later for target world position, but not for C3 skeleton directly
+// import { object3DMap } from './transformSystem';
 
-// Query for camera entity
-const cameraQuery = defineQuery([Camera, Transform, Object3DRef]);
-// Query for camera target
-const targetQuery = defineQuery([CameraTarget, Transform]);
+// Constants from the spec
+export const TPS_DEFAULT_PITCH_RAD = THREE.MathUtils.degToRad(-20);
+export const FPS_EYE_HEIGHT = 1.6;
+export const DEFAULT_ZOOM = 3;
+export const ZOOM_MIN = 1;
+export const ZOOM_MAX = 10;
+export const LERP_POSITION_FACTOR = 0.25;
+export const LERP_ROTATION_FACTOR = 0.15;
+export const CAMERA_FOV = 70;
+export const CAMERA_NEAR = 0.1;
+export const CAMERA_FAR = 1000;
+const CAMERA_COLLISION_OFFSET = 0.5; // Offset from wall after collision
+const MIN_CAMERA_LOCAL_Z = 0.4; // Minimum local Z distance for the camera from its pivot
 
-// Helper function to lerp between two numbers
-const lerp = (start: number, end: number, factor: number) => {
-  return start + (end - start) * factor;
-};
+// This enum is also defined in inputLookSystem.ts.
+// Ideally, it would be in a shared types file, e.g., src/ecs/types.ts
+// For now, ensure it's available for the CameraTarget component reference.
+// If importing from inputLookSystem, ensure no circular dependencies arise.
+// Re-defining here temporarily for clarity, or import if inputLookSystem is stable.
+// export enum CameraMode { // REMOVE local definition
+//   TPS = 0,
+//   FPS = 1,
+// }
 
-// Helper function to lerp between two Vector3s
-const lerpVector3 = (start: Vector3, end: Vector3, factor: number) => {
-  return new Vector3(
-    lerp(start.x, end.x, factor),
-    lerp(start.y, end.y, factor),
-    lerp(start.z, end.z, factor)
-  );
-};
+export interface CameraSystemControls {
+  system: System;
+  camera: THREE.PerspectiveCamera;
+  getPivot: () => THREE.Object3D;
+  cleanup: () => void;
+}
 
-export const createCameraSystem = (world: IWorld) => {
-  return defineSystem((world) => {
-    // Get camera entity
-    const cameras = cameraQuery(world);
-    if (cameras.length === 0) return world;
+export function createCameraSystem(
+  world: IWorld, 
+  scene: THREE.Scene,
+  initialAspect: number,
+  gameWindow: Window,
+  playerModelMesh: THREE.Mesh,
+  chunkManager: ChunkManager
+): CameraSystemControls {
+  const gameCamera = new THREE.PerspectiveCamera(CAMERA_FOV, initialAspect, CAMERA_NEAR, CAMERA_FAR);
 
-    const cameraEntity = cameras[0];
-    const cameraObject = object3DMap.get(cameraEntity) as PerspectiveCamera;
-    if (!cameraObject) return world;
+  const cameraPivot = new THREE.Object3D();
+  scene.add(cameraPivot);
+  cameraPivot.add(gameCamera); // Camera is child of pivot
 
-    // Get target entity
-    const targetId = Camera.targetId[cameraEntity];
-    const targets = targetQuery(world).filter(e => e === targetId);
-    if (targets.length === 0) return world;
+  const cameraTargetQuery = defineQuery([CameraTarget, Transform]);
 
-    const targetEntity = targets[0];
-    const targetObject = object3DMap.get(targetEntity);
-    if (!targetObject) return world;
+  // Variables to store target values for lerping
+  const targetPivotPosition = new THREE.Vector3();
+  const targetPivotQuaternion = new THREE.Quaternion();
+  const targetCameraLocalPosition = new THREE.Vector3();
+  const targetCameraLocalQuaternion = new THREE.Quaternion();
+  const tempEuler = new THREE.Euler(); // Reusable Euler for quaternion conversion
 
-    // Get current zoom and lerp factor
-    const zoom = Camera.zoom[cameraEntity];
-    const lerpFactor = Camera.lerpFactor[cameraEntity];
-    const tiltAngle = Camera.tiltAngle[cameraEntity];
+  // For Raycasting
+  const raycaster = new THREE.Raycaster();
+  const rayOrigin = new THREE.Vector3();
+  const rayDirection = new THREE.Vector3();
+  const cameraWorldPosition = new THREE.Vector3();
 
-    // Calculate desired camera position
-    // Start from target position
-    const targetPos = new Vector3(
-      Transform.position.x[targetEntity],
-      Transform.position.y[targetEntity],
-      Transform.position.z[targetEntity]
-    );
+  let tpsOcclusionCheckFrameCounter = 0;
+  const TPS_OCCLUSION_CHECK_FRAME_INTERVAL = 3; // Check every 3 frames (was 2)
 
-    // Calculate camera position based on zoom and tilt
-    const desiredPos = new Vector3(
-      targetPos.x,
-      targetPos.y + zoom * Math.sin(tiltAngle), // Height based on zoom and tilt
-      targetPos.z + zoom * Math.cos(tiltAngle)  // Distance based on zoom and tilt
-    );
+  // Persisted target for camera's local Z, considering occlusion
+  let persistedTargetLocalZ = DEFAULT_ZOOM; // Initialize with default or player's initial if available
+  // TODO: Consider initializing persistedTargetLocalZ with CameraTarget.zoom[playerEntity] if world is already populated.
 
-    // Get current camera position
-    const currentPos = new Vector3(
-      Transform.position.x[cameraEntity],
-      Transform.position.y[cameraEntity],
-      Transform.position.z[cameraEntity]
-    );
+  const cameraSystemLogic = defineSystem((currentWorld: IWorld) => {
+    const entities = cameraTargetQuery(currentWorld);
+    if (entities.length === 0) {
+      return currentWorld;
+    }
+    const targetEid = entities[0];
+    const targetMode = CameraTarget.mode[targetEid];
 
-    // Lerp to desired position
-    const newPos = lerpVector3(currentPos, desiredPos, lerpFactor);
+    if (targetMode === CameraMode.FPS) {
+      playerModelMesh.visible = false;
 
-    // Update camera position
-    Transform.position.x[cameraEntity] = newPos.x;
-    Transform.position.y[cameraEntity] = newPos.y;
-    Transform.position.z[cameraEntity] = newPos.z;
+      // Calculate target pivot position (player's exact position)
+      targetPivotPosition.set(
+        Transform.position.x[targetEid],
+        Transform.position.y[targetEid],
+        Transform.position.z[targetEid]
+      );
 
-    // Update camera object position
-    cameraObject.position.copy(newPos);
+      // Calculate target camera local position (eye height)
+      targetCameraLocalPosition.set(0, FPS_EYE_HEIGHT, 0);
 
-    // Make camera look at target
-    cameraObject.lookAt(targetPos);
+      // Calculate target pivot orientation (yaw)
+      tempEuler.set(0, CameraTarget.yaw[targetEid], 0, 'YXZ');
+      targetPivotQuaternion.setFromEuler(tempEuler);
 
-    return world;
+      // Calculate target camera local orientation (pitch)
+      tempEuler.set(CameraTarget.pitch[targetEid], 0, 0, 'YXZ');
+      targetCameraLocalQuaternion.setFromEuler(tempEuler);
+      
+    } else if (targetMode === CameraMode.TPS) {
+      playerModelMesh.visible = true;
+
+      // Occlusion check runs based on interval
+      tpsOcclusionCheckFrameCounter++;
+      if (tpsOcclusionCheckFrameCounter >= TPS_OCCLUSION_CHECK_FRAME_INTERVAL) {
+        tpsOcclusionCheckFrameCounter = 0;
+
+        cameraPivot.updateMatrixWorld(); 
+        rayOrigin.copy(cameraPivot.position); 
+
+        const idealLocalCamPos = new THREE.Vector3(0, 0, CameraTarget.zoom[targetEid]);
+        const idealWorldCamPos = idealLocalCamPos.applyMatrix4(cameraPivot.matrixWorld);
+        rayDirection.subVectors(idealWorldCamPos, rayOrigin).normalize();
+
+        const raycastDistance = CameraTarget.zoom[targetEid];
+        // CRASH GUARD: Ensure raycastDistance is sensible
+        if (raycastDistance >= MIN_CAMERA_LOCAL_Z && Number.isFinite(raycastDistance)) { 
+            raycaster.set(rayOrigin, rayDirection);
+            raycaster.far = raycastDistance + CAMERA_COLLISION_OFFSET; 
+            raycaster.near = 0; 
+
+            // CRASH GUARD: Ensure raycaster.far (nearbyRadius) is sensible
+            const nearbyRadius = raycaster.far; 
+            if (nearbyRadius > 0 && Number.isFinite(nearbyRadius)) {
+                const chunkMeshes: THREE.Mesh[] = chunkManager.getNearbyChunkMeshes(cameraPivot.position, nearbyRadius);
+                
+                if (chunkMeshes && chunkMeshes.length > 0) { // CRASH GUARD: Ensure meshes exist
+                    const intersects = raycaster.intersectObjects(chunkMeshes, false); 
+                    if (intersects.length > 0) {
+                        let closestHitDistance = raycastDistance;
+                        for (const intersect of intersects) {
+                            if (intersect.object === playerModelMesh) continue; 
+                            if (intersect.distance < closestHitDistance) {
+                                closestHitDistance = intersect.distance;
+                            }
+                        }
+                        if (closestHitDistance < raycastDistance) {
+                            const newOccludedLocalZ = closestHitDistance - CAMERA_COLLISION_OFFSET;
+                            persistedTargetLocalZ = Math.max(MIN_CAMERA_LOCAL_Z, newOccludedLocalZ);
+                        } else {
+                            // No hit closer than desired zoom
+                            persistedTargetLocalZ = CameraTarget.zoom[targetEid];
+                        }
+                    } else {
+                        // No intersections found by raycaster
+                        persistedTargetLocalZ = CameraTarget.zoom[targetEid];
+                    }
+                } else {
+                    // No chunk meshes nearby or nearbyRadius was not sensible, default to player zoom
+                    persistedTargetLocalZ = CameraTarget.zoom[targetEid];
+                }
+            } else {
+                // Raycast distance not sensible, aim for player's desired zoom (or min if zoom is tiny)
+                persistedTargetLocalZ = Math.max(MIN_CAMERA_LOCAL_Z, CameraTarget.zoom[targetEid]);
+            }
+        } else {
+            // Raycast distance not sensible, aim for player's desired zoom (or min if zoom is tiny)
+            persistedTargetLocalZ = Math.max(MIN_CAMERA_LOCAL_Z, CameraTarget.zoom[targetEid]);
+        }
+      } // End of frame interval occlusion check
+
+      // Set the target local position for the camera using the persisted effective zoom
+      targetCameraLocalPosition.set(0, 0, persistedTargetLocalZ);
+
+      // Calculate target pivot position (player's eye-level position)
+      targetPivotPosition.set(
+        Transform.position.x[targetEid],
+        Transform.position.y[targetEid] + FPS_EYE_HEIGHT, 
+        Transform.position.z[targetEid]
+      );
+
+      // Calculate target pivot orientation (yaw)
+      tempEuler.set(0, CameraTarget.yaw[targetEid], 0, 'YXZ');
+      targetPivotQuaternion.setFromEuler(tempEuler);
+
+      // Calculate target camera local orientation (pitch + TPS tilt)
+      tempEuler.set(CameraTarget.pitch[targetEid] + TPS_DEFAULT_PITCH_RAD, 0, 0, 'YXZ');
+      targetCameraLocalQuaternion.setFromEuler(tempEuler);
+    }
+
+    // Apply lerp/slerp
+    cameraPivot.position.lerp(targetPivotPosition, LERP_POSITION_FACTOR);
+    cameraPivot.quaternion.slerp(targetPivotQuaternion, LERP_ROTATION_FACTOR);
+
+    gameCamera.position.lerp(targetCameraLocalPosition, LERP_POSITION_FACTOR);
+    gameCamera.quaternion.slerp(targetCameraLocalQuaternion, LERP_ROTATION_FACTOR);
+
+    return currentWorld;
   });
-}; 
+
+  // Initialize camera to a default state before first lerp if necessary
+  // This helps avoid a jump from (0,0,0) on the very first frame.
+  // We can get the initial player data to set this up.
+  // This part can be tricky if playerEntity is not immediately available or its Transform not set.
+  // For simplicity, we'll assume the initial direct set (before lerping was added) 
+  // in the first few frames will be quick enough, or that initial transform is (0,0,0).
+  // Alternatively, run a single direct set on the first entity found.
+  if (cameraTargetQuery(world).length > 0) {
+    const initialEid = cameraTargetQuery(world)[0];
+    const initialMode = CameraTarget.mode[initialEid];
+    if (initialMode === CameraMode.FPS) {
+        cameraPivot.position.set(Transform.position.x[initialEid], Transform.position.y[initialEid], Transform.position.z[initialEid]);
+        gameCamera.position.set(0, FPS_EYE_HEIGHT, 0);
+        tempEuler.set(0, CameraTarget.yaw[initialEid], 0, 'YXZ');
+        cameraPivot.quaternion.setFromEuler(tempEuler);
+        tempEuler.set(CameraTarget.pitch[initialEid], 0, 0, 'YXZ');
+        gameCamera.quaternion.setFromEuler(tempEuler);
+    } else { // TPS initial
+        cameraPivot.position.set(Transform.position.x[initialEid], Transform.position.y[initialEid] + FPS_EYE_HEIGHT, Transform.position.z[initialEid]);
+        gameCamera.position.set(0, 0, CameraTarget.zoom[initialEid] || DEFAULT_ZOOM); // Use default zoom if not set
+        tempEuler.set(0, CameraTarget.yaw[initialEid], 0, 'YXZ');
+        cameraPivot.quaternion.setFromEuler(tempEuler);
+        tempEuler.set(CameraTarget.pitch[initialEid] + TPS_DEFAULT_PITCH_RAD, 0, 0, 'YXZ');
+        gameCamera.quaternion.setFromEuler(tempEuler);
+    }
+    // Also copy these to target values to avoid lerp on first frame from zero
+    targetPivotPosition.copy(cameraPivot.position);
+    targetPivotQuaternion.copy(cameraPivot.quaternion);
+    targetCameraLocalPosition.copy(gameCamera.position);
+    targetCameraLocalQuaternion.copy(gameCamera.quaternion);
+  }
+
+  const handleResize = () => {
+    gameCamera.aspect = gameWindow.innerWidth / gameWindow.innerHeight;
+    gameCamera.updateProjectionMatrix();
+  };
+
+  gameWindow.addEventListener('resize', handleResize);
+
+  const cleanup = () => {
+    gameWindow.removeEventListener('resize', handleResize);
+    if (gameCamera.parent) {
+      gameCamera.parent.remove(gameCamera);
+    }
+    scene.remove(cameraPivot); // This also removes gameCamera if it's still a child
+    // Note: Three.js objects don't have a .clear() method.
+    // Disposing geometries/materials would be done if the camera/pivot had custom ones.
+    console.log('CameraSystem cleaned up.');
+  };
+
+  return {
+    system: cameraSystemLogic,
+    camera: gameCamera,
+    getPivot: () => cameraPivot,
+    cleanup,
+  };
+} 

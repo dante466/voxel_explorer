@@ -483,4 +483,54 @@ export class ChunkManager {
     this.chunkData.clear();
     this.lastPlayerPosition = null;
   }
+
+  public getLoadedChunkMeshes(): THREE.Mesh[] {
+    const meshes: THREE.Mesh[] = [];
+    for (const chunkMesh of this.loadedChunks.values()) {
+      meshes.push(chunkMesh.mesh);
+    }
+    return meshes;
+  }
+
+  public getNearbyChunkMeshes(centerWorldPos: THREE.Vector3, worldRadius: number): THREE.Mesh[] {
+    const nearbyMeshes: THREE.Mesh[] = [];
+    const centerChunkX = Math.floor(centerWorldPos.x / 32);
+    const centerChunkZ = Math.floor(centerWorldPos.z / 32);
+    // Calculate chunk radius based on world radius. Add 1 to ensure chunks at the edge are included.
+    const chunkCellRadius = Math.ceil(worldRadius / 32) + 1; 
+
+    const worldRadiusSq = worldRadius * worldRadius;
+
+    for (let dX = -chunkCellRadius; dX <= chunkCellRadius; dX++) {
+      for (let dZ = -chunkCellRadius; dZ <= chunkCellRadius; dZ++) {
+        const checkChunkX = centerChunkX + dX;
+        const checkChunkZ = centerChunkZ + dZ;
+
+        const key = this.getChunkKey(checkChunkX, checkChunkZ);
+        const chunkMeshDetails = this.loadedChunks.get(key);
+
+        if (chunkMeshDetails) {
+          const chunkMinX = checkChunkX * 32;
+          const chunkMinZ = checkChunkZ * 32;
+          const chunkMaxX = chunkMinX + 32;
+          const chunkMaxZ = chunkMinZ + 32;
+
+          // Find the point on the AABB closest to the circle's center
+          const closestX = Math.max(chunkMinX, Math.min(centerWorldPos.x, chunkMaxX));
+          const closestZ = Math.max(chunkMinZ, Math.min(centerWorldPos.z, chunkMaxZ));
+
+          // Calculate the distance squared between the circle's center and this closest point
+          const distanceSq = 
+            (centerWorldPos.x - closestX) * (centerWorldPos.x - closestX) +
+            (centerWorldPos.z - closestZ) * (centerWorldPos.z - closestZ);
+
+          // If the distance squared is less than or equal to the circle's radius squared, they intersect
+          if (distanceSq <= worldRadiusSq) {
+            nearbyMeshes.push(chunkMeshDetails.mesh);
+          }
+        }
+      }
+    }
+    return nearbyMeshes;
+  }
 } 

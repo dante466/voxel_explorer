@@ -1,20 +1,108 @@
 import './style.css';
 import * as THREE from 'three';
 import Stats from 'stats.js';
-import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+// import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js'; // REMOVED
 import { NoiseManager } from './world/NoiseManager';
 import { MesherManager } from './world/MesherManager';
 import { ChunkManager } from './world/ChunkManager';
 import { NetworkManager } from './net/NetworkManager';
 
+// ECS IMPORTS
+import { createECSWorld, Transform } from './ecs/world';
+import { CameraTarget } from './ecs/components/CameraTarget';
+import {
+  createCameraSystem,
+  type CameraSystemControls,
+  FPS_EYE_HEIGHT,
+  DEFAULT_ZOOM,
+} from './ecs/systems/cameraSystem';
+import { CameraMode } from './ecs/types';
+import { createInputLookSystem } from './ecs/systems/inputLookSystem';
+import { createTransformSystem, addObject3DToEntity, object3DMap } from './ecs/systems/transformSystem';
+import { createPlayerMovementSystem, type PlayerMovementSystemControls } from './ecs/systems/PlayerMovementSystem';
+import { addEntity, addComponent, hasComponent } from 'bitecs';
+import { type System as BitecsSystem, type IWorld } from 'bitecs';
+import { Object3DRef } from './ecs/systems/transformSystem';
+
+// Player Model Constants
+const PLAYER_HEIGHT = 1.8; // meters
+const PLAYER_RADIUS = 0.4; // meters
+
 // Initialize scene
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87CEEB); // Sky blue background
 
-// Initialize camera
-const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-camera.position.set(0, 100, 0); // Start well above terrain (base height 20 + sea level 64 + extra buffer)
-camera.lookAt(0, 0, 0);
+// Initialize ECS World
+const world = createECSWorld();
+
+// Initialize Camera System
+const initialAspect = window.innerWidth / window.innerHeight;
+// Player model mesh is created later, so we'll need to pass it after its creation.
+// For now, this call will need to be adjusted or CameraSystem needs to fetch it.
+// Let's defer full CameraSystem init or pass a placeholder / update it later.
+// Temp: For now, just adjust the call, assuming playerModelMesh is defined before this line
+// This ordering will be fixed by moving playerModelMesh creation up.
+
+// Initialize Input Look System
+const inputLookSystemInstance: BitecsSystem = createInputLookSystem(world, document);
+
+// Initialize Transform System
+const transformSystem = createTransformSystem(world);
+
+// Create Player Entity (MUST BE BEFORE PlayerMovementSystem initialization)
+const playerEntity = addEntity(world);
+addComponent(world, Transform, playerEntity);
+Transform.position.x[playerEntity] = 0;
+Transform.position.y[playerEntity] = 70.0; // Temporary spawn height, gravity will adjust
+Transform.position.z[playerEntity] = 10; // Start a bit further back
+Transform.rotation.x[playerEntity] = 0;
+Transform.rotation.y[playerEntity] = 0;
+Transform.rotation.z[playerEntity] = 0;
+Transform.rotation.w[playerEntity] = 1; // Identity quaternion
+Transform.scale.x[playerEntity] = 1;
+Transform.scale.y[playerEntity] = 1;
+Transform.scale.z[playerEntity] = 1;
+
+addComponent(world, CameraTarget, playerEntity);
+CameraTarget.mode[playerEntity] = CameraMode.FPS; // Default to FPS
+CameraTarget.zoom[playerEntity] = DEFAULT_ZOOM;
+CameraTarget.pitch[playerEntity] = 0;
+CameraTarget.yaw[playerEntity] = 0; // Initial yaw, looking along -Z
+
+// Create Player Model Mesh (MOVED UP before CameraSystem initialization)
+const playerGeometry = new THREE.CylinderGeometry(PLAYER_RADIUS, PLAYER_RADIUS, PLAYER_HEIGHT, 16);
+const playerMaterial = new THREE.MeshBasicMaterial({ color: 0x0077ff }); // Blue color
+const playerModelMesh = new THREE.Mesh(playerGeometry, playerMaterial);
+playerModelMesh.position.y = PLAYER_HEIGHT / 2; 
+scene.add(playerModelMesh);
+
+// Initialize managers (needs to be before CameraSystem if it uses chunkManager)
+const noiseManager = new NoiseManager(12345);
+const mesherManager = new MesherManager();
+const chunkManager = new ChunkManager(noiseManager, mesherManager, scene, 4, 100, 5);
+
+// NOW Initialize Camera System, passing playerModelMesh and chunkManager
+const cameraSystemManager = createCameraSystem(world, scene, initialAspect, window, playerModelMesh, chunkManager);
+const gameCamera = cameraSystemManager.camera;
+
+// Associate player model with player entity for transformSystem
+// Ensure Object3DRef component is added before transformSystem runs if it relies on enterQuery
+// addObject3DToEntity handles adding the component and map entry.
+if (!hasComponent(world, Object3DRef, playerEntity)) {
+    addComponent(world, Object3DRef, playerEntity);
+}
+Object3DRef.value[playerEntity] = playerEntity; // Or some other unique ID if your system expects it.
+                                              // For now, map key is entity, value is Object3D.
+object3DMap.set(playerEntity, playerModelMesh);
+
+// Initialize Player Movement System (AFTER playerEntity is created and chunkManager is available)
+const movementSystemControls = createPlayerMovementSystem(world, playerEntity, document, chunkManager);
+const playerMovementSystem = movementSystemControls.system;
+
+// OLD CAMERA INITIALIZATION - REMOVED
+// const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+// camera.position.set(0, 100, 0); 
+// camera.lookAt(0, 0, 0);
 
 // Initialize renderer
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -23,9 +111,9 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
-// Initialize pointer lock controls
-const controls = new PointerLockControls(camera, document.body);
-scene.add(controls.getObject());
+// OLD POINTER LOCK CONTROLS - REMOVED
+// const controls = new PointerLockControls(camera, document.body);
+// scene.add(controls.getObject());
 
 // Add lighting
 const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
@@ -56,14 +144,17 @@ const collisionMaterial = new THREE.MeshBasicMaterial({
   polygonOffsetUnits: 1
 });
 
+// Cache for collision meshes
+const collisionMeshCache: Map<string, THREE.Mesh> = new Map();
+
 // Track last chunk position for collision visualization
 let lastCollisionChunkX = -1;
 let lastCollisionChunkZ = -1;
 
 // Debug mode variables
-let isFlying = true; // Enable flying mode by default
-const flySpeed = 15.0;
-let showCollisionBoxes = true; // Show collision boxes by default
+let isFlying = true; // This will be controlled by a new movement system later
+const flySpeed = 15.0; // This will be controlled by a new movement system later
+let showCollisionBoxes = false; // Show collision boxes by default - CHANGED TO FALSE
 
 // Create admin menu
 const adminMenu = document.createElement('div');
@@ -102,376 +193,320 @@ document.body.appendChild(adminMenu);
 const flyingToggle = document.getElementById('flyingToggle') as HTMLInputElement;
 const collisionToggle = document.getElementById('collisionToggle') as HTMLInputElement;
 
+// Ensure admin UI flying toggle is in sync with PlayerMovementSystem state initially
+if (flyingToggle) flyingToggle.checked = movementSystemControls.isFlying();
+
+// Ensure admin UI collision toggle is in sync with showCollisionBoxes state initially
+if (collisionToggle) collisionToggle.checked = showCollisionBoxes; // ADDED THIS LINE
+
 flyingToggle.addEventListener('change', (e) => {
-  isFlying = (e.target as HTMLInputElement).checked;
-  console.debug(`Flying mode ${isFlying ? 'enabled' : 'disabled'}`);
-  // Reset velocity when toggling modes
-  velocity.set(0, 0, 0);
+  const isChecked = (e.target as HTMLInputElement).checked;
+  if (isChecked !== movementSystemControls.isFlying()) {
+    movementSystemControls.toggleFlying(); // Sync with PlayerMovementSystem's state
+  }
+  // The PlayerMovementSystem's toggleFlyingLocal will update the checkbox state again,
+  // so no need to explicitly set it here if called through movementSystemControls.toggleFlying().
 });
 
 collisionToggle.addEventListener('change', (e) => {
   showCollisionBoxes = (e.target as HTMLInputElement).checked;
   console.debug(`Collision boxes ${showCollisionBoxes ? 'enabled' : 'disabled'}`);
-  // Remove existing collision visualization if turning off
   if (!showCollisionBoxes) {
+    // Hide all cached collision meshes
+    collisionMeshCache.forEach(mesh => {
+      mesh.visible = false;
+    });
+    // Optionally, also remove from scene if they are direct children.
+    // The `updateCollisionVisualization` logic will handle making them visible again if needed.
+    // Keeping existing removal for safety, though visibility should suffice.
     scene.children.forEach(child => {
       if (child.userData.isCollisionVisual) {
-        scene.remove(child);
+        child.visible = false; // Primarily rely on this
+        // scene.remove(child); // Avoid removing if we plan to reuse from cache
       }
     });
   } else {
-    // Force update collision visualization
+    // Force update collision visualization by resetting last chunk pos
     lastCollisionChunkX = -1;
     lastCollisionChunkZ = -1;
+    // And ensure all relevant cached meshes are made visible on next update
+    // (updateCollisionVisualization will handle this)
   }
 });
 
-// Function to check if a point is in view frustum
-function isInViewFrustum(camera: THREE.PerspectiveCamera, point: THREE.Vector3): boolean {
+// Function to check if a point is in view frustum - uses gameCamera now
+function isInViewFrustum(currentCamera: THREE.PerspectiveCamera, point: THREE.Vector3): boolean {
   const frustum = new THREE.Frustum();
   const projScreenMatrix = new THREE.Matrix4();
-  projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  projScreenMatrix.multiplyMatrices(currentCamera.projectionMatrix, currentCamera.matrixWorldInverse);
   frustum.setFromProjectionMatrix(projScreenMatrix);
   return frustum.containsPoint(point);
 }
 
-// Function to update collision visualization
-function updateCollisionVisualization(playerPos: THREE.Vector3, camera: THREE.PerspectiveCamera) {
-  // Skip if collision boxes are disabled
-  if (!showCollisionBoxes) return;
+// Helper function to get chunk data (can remain outside or be passed if preferred)
+function getChunkDataForCollision(chunkX: number, chunkZ: number) {
+  const key = `${chunkX},${chunkZ}`;
+  return chunkManager.getChunkData(key); // Assumes chunkManager is accessible in this scope
+}
 
-  // Check if we've moved to a new chunk
-  const currentChunkX = Math.floor(playerPos.x / 32);
-  const currentChunkZ = Math.floor(playerPos.z / 32);
+// Helper function to check if a block exists, handling chunk boundaries (can remain outside or be passed)
+function hasBlockForCollision(worldX: number, worldY: number, worldZ: number): boolean {
+  if (worldY < 0 || worldY >= 128) return false;
   
-  if (currentChunkX === lastCollisionChunkX && currentChunkZ === lastCollisionChunkZ) {
-    return; // Don't update if we're in the same chunk
+  const chunkX = Math.floor(worldX / 32);
+  const chunkZ = Math.floor(worldZ / 32);
+  const localX = ((worldX % 32) + 32) % 32; // Handle negative coordinates
+  const localZ = ((worldZ % 32) + 32) % 32;
+  
+  const chunkData = getChunkDataForCollision(chunkX, chunkZ);
+  if (!chunkData) return false;
+  
+  return chunkData.hasBlock(localX, worldY, localZ);
+}
+
+function generateCollisionMeshForChunk(
+    targetChunkX: number, 
+    targetChunkZ: number, 
+    playerWorldX: number, // Current player X for distance culling
+    playerWorldZ: number  // Current player Z for distance culling
+  ): THREE.Mesh | null {
+  
+  const chunkData = getChunkDataForCollision(targetChunkX, targetChunkZ);
+  if (!chunkData) {
+    // console.debug(`No chunk data found for collision mesh generation at ${targetChunkX},${targetChunkZ}`);
+    return null;
   }
-  
-  console.debug(`Updating collision visualization for chunk (${currentChunkX}, ${currentChunkZ})`);
-  
-  // Update last chunk position
-  lastCollisionChunkX = currentChunkX;
-  lastCollisionChunkZ = currentChunkZ;
 
-  // Remove old collision visualization
-  scene.children.forEach(child => {
-    if (child.userData.isCollisionVisual) {
-      scene.remove(child);
-    }
-  });
-
-  // Create collision visualization for surrounding chunks
-  const chunkX = Math.floor(playerPos.x / 32);
-  const chunkZ = Math.floor(playerPos.z / 32);
-  
-  // Reduce radius to improve performance
-  const chunkRadius = 2; // Only show 2 chunks in each direction
-  
-  let totalBlocks = 0;
-  let visibleBlocks = 0;
-  
-  // Create a single geometry for all collision faces
   const positions: number[] = [];
   const indices: number[] = [];
   let vertexCount = 0;
-  
-  // Increased offset to make collision boxes more visible above terrain
-  const offset = 0.05; // Increased from 0.001 to 0.05
-  
-  // Helper function to get chunk data
-  function getChunkData(chunkX: number, chunkZ: number) {
-    const key = `${chunkX},${chunkZ}`;
-    return chunkManager.getChunkData(key);
-  }
-  
-  // Helper function to check if a block exists, handling chunk boundaries
-  function hasBlock(worldX: number, worldY: number, worldZ: number): boolean {
-    if (worldY < 0 || worldY >= 128) return false;
-    
-    const chunkX = Math.floor(worldX / 32);
-    const chunkZ = Math.floor(worldZ / 32);
-    const localX = ((worldX % 32) + 32) % 32; // Handle negative coordinates
-    const localZ = ((worldZ % 32) + 32) % 32;
-    
-    const chunkData = getChunkData(chunkX, chunkZ);
-    if (!chunkData) return false;
-    
-    return chunkData.hasBlock(localX, worldY, localZ);
-  }
-  
-  // Check chunks within radius
-  for (let x = -chunkRadius; x <= chunkRadius; x++) {
-    for (let z = -chunkRadius; z <= chunkRadius; z++) {
-      const currentChunkX = chunkX + x;
-      const currentChunkZ = chunkZ + z;
-      
-      // Get chunk data
-      const chunkData = getChunkData(currentChunkX, currentChunkZ);
-      if (!chunkData) {
-        console.debug(`No chunk data found for ${currentChunkX},${currentChunkZ}`);
-        continue;
-      }
+  const offset = 0.05;
+  // let visibleBlocksInChunk = 0;
 
-      // Create collision visualization for each block in the chunk
-      for (let blockX = 0; blockX < 32; blockX++) {
-        for (let blockZ = 0; blockZ < 32; blockZ++) {
-          for (let blockY = 0; blockY < 128; blockY++) {
-            // Check if block exists
-            if (!chunkData.hasBlock(blockX, blockY, blockZ)) continue;
-            
-            totalBlocks++;
+  for (let blockX = 0; blockX < 32; blockX++) {
+    for (let blockZ = 0; blockZ < 32; blockZ++) {
+      for (let blockY = 0; blockY < 128; blockY++) {
+        if (!chunkData.hasBlock(blockX, blockY, blockZ)) continue;
 
-            const worldX = currentChunkX * 32 + blockX;
-            const worldZ = currentChunkZ * 32 + blockZ;
-            
-            // Calculate distance to block center
-            const blockCenterX = worldX + 0.5;
-            const blockCenterZ = worldZ + 0.5;
-            const blockDx = blockCenterX - playerPos.x;
-            const blockDz = blockCenterZ - playerPos.z;
-            const blockDistance = Math.sqrt(blockDx * blockDx + blockDz * blockDz);
-            
-            // Skip blocks beyond 32 units (1 chunk)
-            if (blockDistance > 32) continue;
+        const worldX = targetChunkX * 32 + blockX;
+        const worldY = blockY; // worldY is just blockY in this context
+        const worldZ = targetChunkZ * 32 + blockZ;
+        
+        const hasTop = !hasBlockForCollision(worldX, worldY + 1, worldZ);
+        const hasBottom = !hasBlockForCollision(worldX, worldY - 1, worldZ);
+        const hasFront = !hasBlockForCollision(worldX, worldY, worldZ + 1);
+        const hasBack = !hasBlockForCollision(worldX, worldY, worldZ - 1);
+        const hasRight = !hasBlockForCollision(worldX + 1, worldY, worldZ);
+        const hasLeft = !hasBlockForCollision(worldX - 1, worldY, worldZ);
 
-            // Check which faces are exposed to air, using world coordinates
-            const hasTop = !hasBlock(worldX, blockY + 1, worldZ);
-            const hasBottom = !hasBlock(worldX, blockY - 1, worldZ);
-            const hasFront = !hasBlock(worldX, blockY, worldZ + 1);
-            const hasBack = !hasBlock(worldX, blockY, worldZ - 1);
-            const hasRight = !hasBlock(worldX + 1, blockY, worldZ);
-            const hasLeft = !hasBlock(worldX - 1, blockY, worldZ);
+        if (!hasTop && !hasBottom && !hasFront && !hasBack && !hasRight && !hasLeft) continue;
+        // visibleBlocksInChunk++;
 
-            // Skip if no faces are exposed
-            if (!hasTop && !hasBottom && !hasFront && !hasBack && !hasRight && !hasLeft) continue;
-
-            visibleBlocks++;
+        const x_pos = worldX + 0.5;
+        const y_pos = worldY + 0.5;
+        const z_pos = worldZ + 0.5;
             
-            // Add vertices for exposed faces
-            const x = blockCenterX;
-            const y = blockY + 0.5;
-            const z = blockCenterZ;
-            
-            // Top face
-            if (hasTop) {
-              positions.push(
-                x - 0.5, y + 0.5 + offset, z - 0.5,  // bottom left
-                x + 0.5, y + 0.5 + offset, z - 0.5,  // bottom right
-                x + 0.5, y + 0.5 + offset, z + 0.5,  // top right
-                x - 0.5, y + 0.5 + offset, z + 0.5   // top left
-              );
-              indices.push(
-                vertexCount, vertexCount + 1, vertexCount + 2,
-                vertexCount, vertexCount + 2, vertexCount + 3
-              );
-              vertexCount += 4;
-            }
-            
-            // Bottom face
-            if (hasBottom) {
-              positions.push(
-                x - 0.5, y - 0.5 - offset, z - 0.5,  // bottom left
-                x + 0.5, y - 0.5 - offset, z - 0.5,  // bottom right
-                x + 0.5, y - 0.5 - offset, z + 0.5,  // top right
-                x - 0.5, y - 0.5 - offset, z + 0.5   // top left
-              );
-              indices.push(
-                vertexCount, vertexCount + 1, vertexCount + 2,
-                vertexCount, vertexCount + 2, vertexCount + 3
-              );
-              vertexCount += 4;
-            }
-            
-            // Front face
-            if (hasFront) {
-              positions.push(
-                x - 0.5, y - 0.5, z + 0.5 + offset,  // bottom left
-                x + 0.5, y - 0.5, z + 0.5 + offset,  // bottom right
-                x + 0.5, y + 0.5, z + 0.5 + offset,  // top right
-                x - 0.5, y + 0.5, z + 0.5 + offset   // top left
-              );
-              indices.push(
-                vertexCount, vertexCount + 1, vertexCount + 2,
-                vertexCount, vertexCount + 2, vertexCount + 3
-              );
-              vertexCount += 4;
-            }
-            
-            // Back face
-            if (hasBack) {
-              positions.push(
-                x - 0.5, y - 0.5, z - 0.5 - offset,  // bottom left
-                x + 0.5, y - 0.5, z - 0.5 - offset,  // bottom right
-                x + 0.5, y + 0.5, z - 0.5 - offset,  // top right
-                x - 0.5, y + 0.5, z - 0.5 - offset   // top left
-              );
-              indices.push(
-                vertexCount, vertexCount + 1, vertexCount + 2,
-                vertexCount, vertexCount + 2, vertexCount + 3
-              );
-              vertexCount += 4;
-            }
-            
-            // Right face
-            if (hasRight) {
-              positions.push(
-                x + 0.5 + offset, y - 0.5, z - 0.5,  // bottom left
-                x + 0.5 + offset, y - 0.5, z + 0.5,  // bottom right
-                x + 0.5 + offset, y + 0.5, z + 0.5,  // top right
-                x + 0.5 + offset, y + 0.5, z - 0.5   // top left
-              );
-              indices.push(
-                vertexCount, vertexCount + 1, vertexCount + 2,
-                vertexCount, vertexCount + 2, vertexCount + 3
-              );
-              vertexCount += 4;
-            }
-            
-            // Left face
-            if (hasLeft) {
-              positions.push(
-                x - 0.5 - offset, y - 0.5, z - 0.5,  // bottom left
-                x - 0.5 - offset, y - 0.5, z + 0.5,  // bottom right
-                x - 0.5 - offset, y + 0.5, z + 0.5,  // top right
-                x - 0.5 - offset, y + 0.5, z - 0.5   // top left
-              );
-              indices.push(
-                vertexCount, vertexCount + 1, vertexCount + 2,
-                vertexCount, vertexCount + 2, vertexCount + 3
-              );
-              vertexCount += 4;
-            }
-          }
+        if (hasTop) {
+          positions.push(
+            x_pos - 0.5, y_pos + 0.5 + offset, z_pos - 0.5, x_pos + 0.5, y_pos + 0.5 + offset, z_pos - 0.5,
+            x_pos + 0.5, y_pos + 0.5 + offset, z_pos + 0.5, x_pos - 0.5, y_pos + 0.5 + offset, z_pos + 0.5
+          );
+          indices.push(vertexCount, vertexCount + 1, vertexCount + 2, vertexCount, vertexCount + 2, vertexCount + 3);
+          vertexCount += 4;
+        }
+        if (hasBottom) {
+          positions.push(
+            x_pos - 0.5, y_pos - 0.5 - offset, z_pos - 0.5, x_pos + 0.5, y_pos - 0.5 - offset, z_pos - 0.5,
+            x_pos + 0.5, y_pos - 0.5 - offset, z_pos + 0.5, x_pos - 0.5, y_pos - 0.5 - offset, z_pos + 0.5
+          );
+          indices.push(vertexCount, vertexCount + 1, vertexCount + 2, vertexCount, vertexCount + 2, vertexCount + 3);
+          vertexCount += 4;
+        }
+        if (hasFront) {
+          positions.push(
+            x_pos - 0.5, y_pos - 0.5, z_pos + 0.5 + offset, x_pos + 0.5, y_pos - 0.5, z_pos + 0.5 + offset,
+            x_pos + 0.5, y_pos + 0.5, z_pos + 0.5 + offset, x_pos - 0.5, y_pos + 0.5, z_pos + 0.5 + offset
+          );
+          indices.push(vertexCount, vertexCount + 1, vertexCount + 2, vertexCount, vertexCount + 2, vertexCount + 3);
+          vertexCount += 4;
+        }
+        if (hasBack) {
+          positions.push(
+            x_pos - 0.5, y_pos - 0.5, z_pos - 0.5 - offset, x_pos + 0.5, y_pos - 0.5, z_pos - 0.5 - offset,
+            x_pos + 0.5, y_pos + 0.5, z_pos - 0.5 - offset, x_pos - 0.5, y_pos + 0.5, z_pos - 0.5 - offset
+          );
+          indices.push(vertexCount, vertexCount + 1, vertexCount + 2, vertexCount, vertexCount + 2, vertexCount + 3);
+          vertexCount += 4;
+        }
+        if (hasRight) {
+          positions.push(
+            x_pos + 0.5 + offset, y_pos - 0.5, z_pos - 0.5, x_pos + 0.5 + offset, y_pos - 0.5, z_pos + 0.5,
+            x_pos + 0.5 + offset, y_pos + 0.5, z_pos + 0.5, x_pos + 0.5 + offset, y_pos + 0.5, z_pos - 0.5
+          );
+          indices.push(vertexCount, vertexCount + 1, vertexCount + 2, vertexCount, vertexCount + 2, vertexCount + 3);
+          vertexCount += 4;
+        }
+        if (hasLeft) {
+          positions.push(
+            x_pos - 0.5 - offset, y_pos - 0.5, z_pos - 0.5, x_pos - 0.5 - offset, y_pos - 0.5, z_pos + 0.5,
+            x_pos - 0.5 - offset, y_pos + 0.5, z_pos + 0.5, x_pos - 0.5 - offset, y_pos + 0.5, z_pos - 0.5
+          );
+          indices.push(vertexCount, vertexCount + 1, vertexCount + 2, vertexCount, vertexCount + 2, vertexCount + 3);
+          vertexCount += 4;
         }
       }
     }
   }
-  
-  // Create a single mesh for all collision faces
-  if (positions.length > 0) {
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geometry.setIndex(indices);
-    
-    const mesh = new THREE.Mesh(geometry, collisionMaterial);
-    mesh.userData.isCollisionVisual = true;
-    mesh.renderOrder = 1; // Ensure collision boxes render after terrain
-    scene.add(mesh);
+
+  if (positions.length === 0) {
+    // console.debug(`No visible collision faces for chunk ${targetChunkX},${targetChunkZ}`);
+    return null;
   }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setIndex(indices);
   
-  console.debug(`Created collision visualization: ${visibleBlocks} visible blocks out of ${totalBlocks} total blocks`);
+  const mesh = new THREE.Mesh(geometry, collisionMaterial); // collisionMaterial is global
+  mesh.renderOrder = 1; 
+  // The mesh is positioned at (0,0,0) because its vertex coordinates are already in world space.
+  // Or, if vertices are local to chunk, set mesh.position.set(targetChunkX * 32, 0, targetChunkZ * 32);
+  // Current implementation has vertices in world space, so mesh position is (0,0,0).
+  
+  // console.debug(`Generated collision mesh for chunk ${targetChunkX},${targetChunkZ} with ${visibleBlocksInChunk} visible blocks.`);
+  return mesh;
 }
 
-// Character movement variables
-const velocity = new THREE.Vector3();
-const direction = new THREE.Vector3();
-let moveForward = false;
-let moveBackward = false;
-let moveLeft = false;
-let moveRight = false;
-let moveUp = false;
-let moveDown = false;
-let canJump = false;
-const gravity = 50;
-const playerHeight = 2;
-const playerSpeed = 10.0;
-const maxFallSpeed = 50;
-const groundCheckDistance = 0.1;
-const minGroundHeight = 64;
-const jumpForce = 10;
-const collisionCheckPoints = 4; // Number of points to check for collision
+// Function to update collision visualization - uses gameCamera now
+function updateCollisionVisualization(playerPos: THREE.Vector3, _currentCamera: THREE.PerspectiveCamera) {
+  if (!showCollisionBoxes) {
+    return;
+  }
 
-// Movement controls
-const onKeyDown = (event: KeyboardEvent) => {
+  const currentPlayerChunkX = Math.floor(playerPos.x / 32);
+  const currentPlayerChunkZ = Math.floor(playerPos.z / 32);
+  
+  const chunkDisplayRadiusChunks = 2; // How many chunks in each direction to initially consider
+  const collisionVisualizationWorldRadius = chunkDisplayRadiusChunks * 32; // e.g., 2 * 32 = 64 world units
+  const visibleChunkKeys = new Set<string>();
+
+  // Determine which chunk keys should be visible based on a world radius
+  for (let xOffset = -chunkDisplayRadiusChunks; xOffset <= chunkDisplayRadiusChunks; xOffset++) {
+    for (let zOffset = -chunkDisplayRadiusChunks; zOffset <= chunkDisplayRadiusChunks; zOffset++) {
+      const vizChunkX = currentPlayerChunkX + xOffset;
+      const vizChunkZ = currentPlayerChunkZ + zOffset;
+      
+      // Calculate center of this visualization candidate chunk
+      const chunkCenterX = vizChunkX * 32 + 16; // 16 is half of chunk size 32
+      const chunkCenterZ = vizChunkZ * 32 + 16;
+
+      const dx = playerPos.x - chunkCenterX;
+      const dz = playerPos.z - chunkCenterZ;
+      const distanceToChunkCenter = Math.sqrt(dx * dx + dz * dz);
+
+      if (distanceToChunkCenter <= collisionVisualizationWorldRadius) {
+        visibleChunkKeys.add(`${vizChunkX},${vizChunkZ}`);
+      }
+    }
+  }
+
+  // Make non-visible cached meshes invisible
+  collisionMeshCache.forEach((mesh, key) => {
+    if (!visibleChunkKeys.has(key)) {
+      mesh.visible = false;
+    }
+  });
+
+  // Process chunks that should be visible
+  visibleChunkKeys.forEach(key => {
+    let mesh: THREE.Mesh | null | undefined = collisionMeshCache.get(key);
+    if (mesh) {
+      mesh.visible = true;
+      // Ensure it's in the scene (it should be if cached and not manually removed elsewhere)
+      if (!mesh.parent) {
+        scene.add(mesh);
+      }
+    } else {
+      const [chunkXStr, chunkZStr] = key.split(',');
+      const chunkX = parseInt(chunkXStr, 10);
+      const chunkZ = parseInt(chunkZStr, 10);
+      
+      mesh = generateCollisionMeshForChunk(chunkX, chunkZ, playerPos.x, playerPos.z);
+      if (mesh) {
+        mesh.userData.isCollisionVisual = true;
+        mesh.userData.chunkKey = key; // Store the key for later identification
+        mesh.visible = true;
+        collisionMeshCache.set(key, mesh);
+        scene.add(mesh);
+      }
+    }
+  });
+  // console.debug(`Collision visualization updated. Cache size: ${collisionMeshCache.size}`);
+}
+
+// Minimal onKeyDown & onKeyUp in main.tsx, primarily for non-movement debug keys like Admin Menu
+const mainKeyDownHandler = (event: KeyboardEvent) => {
+  // PlayerMovementSystem handles W,A,S,D,Space,Shift,F,Arrows and calls preventDefault for them.
+  // This handler is for other global keys.
   switch (event.code) {
-    case 'ArrowUp':
-    case 'KeyW':
-      moveForward = true;
-      break;
-    case 'ArrowLeft':
-    case 'KeyA':
-      moveLeft = true;
-      break;
-    case 'ArrowDown':
-    case 'KeyS':
-      moveBackward = true;
-      break;
-    case 'ArrowRight':
-    case 'KeyD':
-      moveRight = true;
-      break;
-    case 'Space':
-      if (isFlying) {
-        moveUp = true;
-      } else if (canJump) {
-        velocity.y = jumpForce;
-        canJump = false;
-      }
-      break;
-    case 'ShiftLeft':
-      if (isFlying) {
-        moveDown = true;
-      }
-      break;
-    case 'KeyF':
-      // Toggle flying mode
-      isFlying = !isFlying;
-      flyingToggle.checked = isFlying;
-      console.debug(`Flying mode ${isFlying ? 'enabled' : 'disabled'}`);
-      // Reset velocity when toggling modes
-      velocity.set(0, 0, 0);
-      break;
     case 'KeyP':
-      // Toggle admin menu
+      event.preventDefault(); // Prevent if 'P' has browser default action while gaming
       adminMenu.style.display = adminMenu.style.display === 'none' ? 'block' : 'none';
       break;
+    case 'KeyC':
+      event.preventDefault(); // Prevent if 'C' has browser default action
+      if (CameraTarget.mode[playerEntity] === CameraMode.FPS) {
+        CameraTarget.mode[playerEntity] = CameraMode.TPS;
+        // When switching to TPS, you might want to ensure a reasonable default zoom
+        // if CameraTarget.zoom hasn't been set by the wheel yet or is 0.
+        if (CameraTarget.zoom[playerEntity] === 0) { // Or some other uninitialized check
+            CameraTarget.zoom[playerEntity] = DEFAULT_ZOOM; // DEFAULT_ZOOM is from CameraSystem
+        }
+        console.log('Switched to TPS Camera Mode');
+      } else {
+        CameraTarget.mode[playerEntity] = CameraMode.FPS;
+        console.log('Switched to FPS Camera Mode');
+      }
+      // Reset pitch on mode switch to avoid disorientation from previous mode's pitch
+      CameraTarget.pitch[playerEntity] = 0;
+      break;
+    // Add other global, non-movement key handlers here if necessary
   }
 };
 
-const onKeyUp = (event: KeyboardEvent) => {
-  switch (event.code) {
-    case 'ArrowUp':
-    case 'KeyW':
-      moveForward = false;
-      break;
-    case 'ArrowLeft':
-    case 'KeyA':
-      moveLeft = false;
-      break;
-    case 'ArrowDown':
-    case 'KeyS':
-      moveBackward = false;
-      break;
-    case 'ArrowRight':
-    case 'KeyD':
-      moveRight = false;
-      break;
-    case 'Space':
-      moveUp = false;
-      break;
-    case 'ShiftLeft':
-      moveDown = false;
-      break;
-  }
+const mainKeyUpHandler = (event: KeyboardEvent) => {
+  // PlayerMovementSystem handles keyup for movement keys if it needs to.
+  // Add other global, non-movement keyup handlers here if necessary.
 };
 
-document.addEventListener('keydown', onKeyDown);
-document.addEventListener('keyup', onKeyUp);
+// Remove old global listeners that were broadly handling movement keys.
+// These specific removeEventListener calls are targeting the old, now undefined, onKeyDown/onKeyUp handlers.
+// They should be removed as PlayerMovementSystem handles its own listeners,
+// and main.tsx now uses mainKeyDownHandler/mainKeyUpHandler for its minimal needs.
+// document.removeEventListener('keydown', onKeyDown); // DELETE THIS LINE
+// document.removeEventListener('keyup', onKeyUp);   // DELETE THIS LINE
 
-// Track last camera position and direction
-let lastCameraPosition = new THREE.Vector3();
-let lastCameraDirection = new THREE.Vector3();
-camera.getWorldDirection(lastCameraDirection);
-lastCameraPosition.copy(camera.position);
+// Add the new minimal listeners for main.tsx (e.g., for admin panel toggle)
+if (typeof mainKeyDownHandler !== 'undefined') document.addEventListener('keydown', mainKeyDownHandler);
+if (typeof mainKeyUpHandler !== 'undefined') document.addEventListener('keyup', mainKeyUpHandler);
 
-// Click to start
+// Track last camera position and direction - OLD
+// let lastCameraPosition = new THREE.Vector3();
+// let lastCameraDirection = new THREE.Vector3();
+// camera.getWorldDirection(lastCameraDirection); // OLD
+// lastCameraPosition.copy(camera.position); // OLD
+
+// Click to start pointer lock (not PointerLockControls)
 renderer.domElement.addEventListener('click', () => {
-  controls.lock();
+  // controls.lock(); // OLD
+  if (!document.pointerLockElement) {
+    renderer.domElement.requestPointerLock();
+  }
 });
 
 // Initialize stats if in debug mode
 const urlParams = new URLSearchParams(window.location.search);
+// ... existing code ...
 const debugMode = urlParams.has('debug');
 let stats: Stats | null = null;
 
@@ -481,143 +516,50 @@ if (debugMode) {
   document.body.appendChild(stats.dom);
 }
 
-// Initialize managers
-const noiseManager = new NoiseManager(12345);
-const mesherManager = new MesherManager();
-const chunkManager = new ChunkManager(noiseManager, mesherManager, scene, 4, 100, 5);
-
-// Initialize network manager
-const networkManager = new NetworkManager('ws://localhost:8080', camera);
+// Initialize network manager - NOW PASSES world and playerEntity
+const networkManager = new NetworkManager('ws://localhost:8080', world, playerEntity);
 networkManager.connect();
 
-// Handle window resize
-window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
+// Handle window resize - NEW CAMERA SYSTEM HANDLES ITS OWN RESIZE
+// window.addEventListener('resize', () => {
+//   camera.aspect = window.innerWidth / window.innerHeight; // OLD
+//   camera.updateProjectionMatrix(); // OLD
+//   renderer.setSize(window.innerWidth, window.innerHeight);
+// });
 
 // Animation loop
 const clock = new THREE.Clock();
+// ... existing code ...
 function animate() {
   requestAnimationFrame(animate);
   stats?.begin();
   
-  if (controls.isLocked) {
-    const delta = clock.getDelta();
-    const playerPos = controls.getObject().position;
+  const delta = clock.getDelta();
 
-    // Update collision visualization with camera
-    updateCollisionVisualization(playerPos, camera);
+    // --- NEW SYSTEM CALLS ---
+    inputLookSystemInstance(world);
+    playerMovementSystem(world, delta);
+    cameraSystemManager.system(world);
+    transformSystem(world);
 
-    // Get ground height at current position
-    const groundHeight = chunkManager.getHeightAtPosition(playerPos.x, playerPos.z);
-    const effectiveGroundHeight = Math.max(groundHeight, minGroundHeight);
-    const isGrounded = Math.abs(playerPos.y - (effectiveGroundHeight + playerHeight)) < groundCheckDistance;
+    // Update ChunkManager with player's ECS position
+    const playerWorldX = Transform.position.x[playerEntity];
+    const playerWorldZ = Transform.position.z[playerEntity];
+    chunkManager.update(playerWorldX, playerWorldZ, scene, true); // Consider if gameCamera needs to be passed for culling
 
-    // Get camera direction for movement
-    const cameraDirection = new THREE.Vector3();
-    camera.getWorldDirection(cameraDirection);
+    // Update collision visualization (if shown) with player's ECS position
+    if (showCollisionBoxes) {
+      const playerPosVec3 = new THREE.Vector3(playerWorldX, Transform.position.y[playerEntity], playerWorldZ);
+      updateCollisionVisualization(playerPosVec3, gameCamera);
+    }
     
-    // Force camera direction to be horizontal for ground movement
-    const horizontalDirection = cameraDirection.clone();
-    horizontalDirection.y = 0;
-    horizontalDirection.normalize();
-
-    // Calculate movement direction based on camera
-    const moveDirection = new THREE.Vector3();
-    
-    if (moveForward) {
-      moveDirection.add(horizontalDirection);
-    }
-    if (moveBackward) {
-      moveDirection.sub(horizontalDirection);
-    }
-    if (moveLeft) {
-      moveDirection.add(new THREE.Vector3(-horizontalDirection.z, 0, horizontalDirection.x));
-    }
-    if (moveRight) {
-      moveDirection.add(new THREE.Vector3(horizontalDirection.z, 0, -horizontalDirection.x));
-    }
-
-    // Normalize movement direction
-    if (moveDirection.length() > 0) {
-      moveDirection.normalize();
-    }
-
-    // Apply movement
-    if (isFlying) {
-      // Flying mode movement
-      const speed = flySpeed * delta;
-      
-      // Horizontal movement
-      playerPos.x += moveDirection.x * speed;
-      playerPos.z += moveDirection.z * speed;
-      
-      // Vertical movement
-      if (moveUp) {
-        playerPos.y += speed;
-      }
-      if (moveDown) {
-        playerPos.y -= speed;
-      }
-      
-      // Reset velocity in flying mode
-      velocity.set(0, 0, 0);
-    } else {
-      // Ground movement
-      const moveX = moveDirection.x * playerSpeed * delta;
-      const moveZ = moveDirection.z * playerSpeed * delta;
-      const targetX = playerPos.x + moveX;
-      const targetZ = playerPos.z + moveZ;
-
-      // Check if we can move to the target position
-      const targetHeight = chunkManager.getHeightAtPosition(targetX, targetZ);
-      const currentHeight = chunkManager.getHeightAtPosition(playerPos.x, playerPos.z);
-      const heightDiff = targetHeight - currentHeight;
-      
-      // Only allow movement if we're grounded and the height difference is reasonable
-      const canMove = isGrounded && Math.abs(heightDiff) <= 1;
-
-      // Apply horizontal movement only if allowed
-      if (canMove) {
-        playerPos.x += moveX;
-        playerPos.z += moveZ;
-      }
-
-      // Apply gravity
-      velocity.y -= gravity * delta;
-      velocity.y = Math.max(-maxFallSpeed, velocity.y);
-
-      // Calculate new vertical position
-      const newY = playerPos.y + velocity.y * delta;
-
-      // Get ground height at new position
-      const newGroundHeight = chunkManager.getHeightAtPosition(playerPos.x, playerPos.z);
-      const newEffectiveGroundHeight = Math.max(newGroundHeight, minGroundHeight);
-      const minY = newEffectiveGroundHeight + playerHeight;
-
-      // Apply vertical movement with collision
-      if (newY < minY) {
-        playerPos.y = minY;
-        velocity.y = 0;
-        canJump = true;
-      } else {
-        playerPos.y = newY;
-        canJump = false;
-      }
-    }
-
-    // Update chunks if position changed
-    chunkManager.update(camera.position.x, camera.position.z, scene, true);
-    lastCameraPosition.copy(camera.position);
-  }
-  
-  renderer.render(scene, camera);
+    // lastCameraPosition.copy(camera.position); // OLD
+  renderer.render(scene, gameCamera); // USE NEW gameCamera
   stats?.end();
 }
 
 // Start animation loop
+// ... existing code ...
 animate();
 
 // Cleanup on page unload
@@ -626,7 +568,22 @@ window.addEventListener('unload', () => {
   chunkManager.dispose();
   noiseManager.dispose();
   mesherManager.dispose();
-  document.removeEventListener('keydown', onKeyDown);
-  document.removeEventListener('keyup', onKeyUp);
-  document.body.removeChild(adminMenu);
+  document.removeEventListener('keydown', mainKeyDownHandler); // Cleanup mainKeyDownHandler
+  document.removeEventListener('keyup', mainKeyUpHandler);   // Cleanup mainKeyUpHandler
+  if (adminMenu.parentNode) document.body.removeChild(adminMenu);
+
+  // New system cleanup
+  cameraSystemManager.cleanup();
+  if ((inputLookSystemInstance as any).cleanup) {
+    (inputLookSystemInstance as any).cleanup();
+  }
+  movementSystemControls.cleanup(); // Cleanup PlayerMovementSystem listeners
+
+  // Cleanup collision visualizer cache
+  collisionMeshCache.forEach(mesh => {
+    if (mesh.geometry) mesh.geometry.dispose();
+    // Material is shared, so don't dispose it here unless it's the last user
+    if (mesh.parent) mesh.parent.remove(mesh);
+  });
+  collisionMeshCache.clear();
 }); 
