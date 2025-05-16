@@ -1,0 +1,104 @@
+Voxel Explorer Project Overview for LLMs (Last Updated: Auto-Generated)
+
+This document provides a detailed breakdown of the Voxel Explorer game project, based on its codebase and technical specification.
+
+0. Vision & Scope
+A hyper-performant, desktop-web, top-down voxel game with procedurally generated terrain. Targets 60 FPS on mid-range hardware with server-side authoritative physics at 30 Hz. MVP focuses on exploration, mining, and building.
+
+1. Core Technologies
+   - Rendering: Three.js (WebGL2)
+   - Physics: Rapier3D (WASM, server-side)
+   - Networking: Raw WebSockets (Client: native WebSocket, Server: 'ws' library)
+   - Language: TypeScript
+   - ECS: 'bitecs' library
+   - Bundling/Dev: Vite
+
+2. Project Structure (Primary Directories in `src/`)
+
+   - `main.tsx`: Main client-side entry point. Initializes Three.js, game loop, managers, debug UI, and handles client-side player movement prediction and rendering.
+   - `ecs/`: Entity Component System.
+     - `world.ts`: `bitecs` world creation, `Transform` component definition (position, rotation, scale).
+     - `components/`:
+       - `camera.ts`: `CameraTarget` (marker) and `Camera` (targetId, zoom, lerp, tilt) components.
+     - `systems/`:
+       - `transformSystem.ts`: Syncs ECS `Transform.position` to Three.js `Object3D.position`. Manages a map of entity IDs to `Object3D` instances.
+       - `cameraSystem.ts`: Implements a lerped follow-camera that tracks a `CameraTarget` entity, adjusting for zoom and tilt.
+   - `world/`: Core voxel world logic.
+     - `Chunk.ts`: Defines `CHUNK_SIZE`, `LOD_CHUNK_SIZE`. `Chunk` class stores voxel data (`Uint8Array`), manages LOD-specific dimensions, provides RLE compression/decompression, and heightmap access.
+     - `noiseWorker.ts`: Web worker using `fast-simplex-noise` for deterministic procedural terrain generation (multi-octave 2D noise for heightmap, 3D noise for caves/features). Outputs raw voxel data and heightmap for a given chunk and LOD.
+     - `NoiseManager.ts`: Manages `noiseWorker.ts`. Handles requests for chunk data generation, returning `Chunk` objects. (Note: Potential issue where it calls `chunk.decompress()` with raw data from worker).
+     - `mesherWorker.ts`: Web worker for generating chunk meshes. Iterates voxels, creates quads for visible faces (block-by-block, not greedy). Outputs positions, normals, UVs (basic, not atlas-aware), and indices. (Note: A hardcoded height issue was fixed; it now uses dynamic height based on LOD).
+     - `MesherManager.ts`: Manages `mesherWorker.ts`. Handles requests for mesh generation from `Chunk` objects.
+     - `ChunkManager.ts`: Orchestrates chunk loading/unloading based on player position, render distance, and LOD settings. Uses `NoiseManager` and `MesherManager`. Manages `THREE.Mesh` objects for chunks with a shared `MeshStandardMaterial`. Implements LRU cache for chunks. Provides `getHeightAtPosition`.
+   - `net/`: Client-side networking.
+     - `WebSocketClient.ts`: Manages WebSocket connection to the server, including exponential backoff reconnection logic. (Note: Sends JSON; FlatBuffers TODO).
+     - `types.ts`: Defines `ClientCommand` structure (player inputs) and network connection state types/constants.
+     - `InputHandler.ts`: Captures keyboard (WASD, QE) and mouse delta (on pointer lock) inputs, assembling them into `ClientCommand` objects.
+     - `NetworkManager.ts`: Coordinates client-side networking. Sends `ClientCommand`s at 30Hz. Implements client-side prediction by directly moving the main camera. Handles basic server `stateUpdate` messages by updating camera position. (Note: FlatBuffers TODO for receiving; advanced state sync/rollback not yet implemented).
+   - `server/`: Server-side logic.
+     - `matchServer.ts`: Main server application using Express and 'ws' for WebSockets. Initializes Rapier3D physics. Manages `matchState` (players, chunks). Basic game loop (30Hz) steps physics and broadcasts full `matchState` to all clients. Handles new connections by sending initial state. (Note: Player command processing and detailed game logic are placeholders. FlatBuffers TODO. No lobby system yet).
+     - `physics.ts`: Initializes Rapier3D and provides a wrapper for creating and managing the Rapier physics world (`world.step()`, body/collider management).
+     - `types.ts`: Defines server-side data structures like `Player`, `Chunk`, `MatchState`, and message types.
+   - `scenes/`: Exists but is currently empty.
+   - `main.ts`: Legacy entry point, likely from project scaffolding phase.
+   - (Missing from `src/` but in spec): `render/`, `utils/`.
+
+3. Key Game Mechanics & Systems Status
+
+   - ECS & Scene Graph: `bitecs` for ECS, Three.js for rendering. `transformSystem` links ECS position to Three.js object positions.
+   - Camera: Top-down tilted follow-camera via ECS. However, `NetworkManager` and `main.tsx` also directly manipulate camera position for prediction/control, indicating potential overlapping responsibilities.
+   - Terrain Generation: Deterministic, noise-based generation in a web worker (`noiseWorker.ts`). Generates voxel data and heightmaps.
+   - Chunk Management:
+     - Streaming: `ChunkManager` loads/unloads chunks based on distance.
+     - LOD: Two-tier LOD system implemented. Chunks are generated and meshed at different resolutions based on distance (`ChunkManager`, `NoiseManager`, `MesherManager`, and workers handle LOD variations).
+   - Meshing: Performed in a web worker (`mesherWorker.ts`).
+     - Algorithm: Currently block-by-block, NOT greedy as specified.
+     - Output: Typed arrays for geometry.
+   - Rendering:
+     - Basic Three.js rendering in `main.tsx`.
+     - Chunks are `THREE.Mesh` objects with a shared `MeshStandardMaterial`.
+     - Texture Atlas & InstancedMesh: Not yet implemented (spec Milestone 2.4). Shaders are basic.
+   - Networking:
+     - Client-Server Communication: WebSocket based. Client sends input commands; server broadcasts state.
+     - Serialization: Uses JSON. FlatBuffers (specified) not yet implemented.
+     - Client-Side Prediction: Implemented in `NetworkManager` by directly moving the camera.
+     - Server Reconciliation/State Sync: Basic full state broadcast. Advanced interpolation/rollback (spec Milestone 3.3) not yet implemented.
+   - Physics: Server-side authoritative using Rapier3D. Physics world is stepped at 30Hz on the server. Client input is not yet driving physics objects on the server.
+   - Player Input: Captured by `InputHandler` and sent as commands.
+   - Mining/Building: Not yet implemented (spec Milestone 4).
+   - Lobby System: Not yet implemented (spec Milestone 5).
+
+4. Notable Discrepancies from Spec / TODOs:
+
+   - FlatBuffers: Required for network messages, currently using JSON.
+   - Greedy Meshing: Implemented as block-by-block.
+   - Texture Atlas & Advanced Renderer: Chunk rendering is basic; no atlas or instanced rendering.
+   - Advanced State Sync: Missing interpolation/rollback.
+   - Server Game Logic: Player command processing, voxel modification, and other core game rules on the server are largely placeholders.
+   - Missing Directories: `src/render` and `src/utils` are not present.
+   - Camera Control Overlap: `main.tsx`, `NetworkManager`, and `cameraSystem` all influence camera position. Clearer ownership may be needed.
+   - Data Flow Anomaly: `NoiseManager` appears to use `chunk.decompress()` with raw data from `noiseWorker` instead of RLE-compressed data.
+
+This overview should provide a good starting point for an LLM to understand the Voxel Explorer project's current state, architecture, and alignment with its technical specification.
+
+5. Key Issues & Recommendations (Priority Order)
+
+   1. Server-Side Game Logic Implementation (Core Gameplay Blocker):
+      - Issue: `matchServer.ts` has placeholders for processing player commands (`playerUpdate`) and handling chunk requests.
+      - Impact: Server is not authoritative for player actions or world changes, blocking gameplay features.
+      - Recommendation: Implement server-side handling of client commands to update player physics states and world data.
+
+   2. Greedy Meshing Implementation (Performance & Spec Adherence):
+      - Issue: `mesherWorker.ts` uses block-by-block meshing, not the specified greedy algorithm.
+      - Impact: Higher vertex counts, poor rendering performance.
+      - Recommendation: Refactor `mesherWorker.ts` to implement a proper greedy meshing algorithm.
+
+   3. FlatBuffers for Network Communication (Performance & Spec Adherence):
+      - Issue: Network communication uses JSON instead of the specified FlatBuffers.
+      - Impact: Affects network latency and processing budget.
+      - Recommendation: Integrate FlatBuffers for network message serialization.
+
+   4. Camera Control Strategy (Potential Bugs & Complexity):
+      - Issue: Overlapping camera control logic in `main.tsx`, `NetworkManager.ts`, and `ecs/systems/cameraSystem.ts`.
+      - Impact: Potential for conflicting updates, jittery movement, and debugging difficulties.
+      - Recommendation: Define a clear, unified strategy for camera control, possibly centralizing it in an enhanced ECS camera system that considers network updates and local input. 
