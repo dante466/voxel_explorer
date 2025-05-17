@@ -1,91 +1,166 @@
-Voxel Explorer Project Overview for LLMs (Last Updated: Current Date - Manual Review)
+Voxel Explorer Project Overview for LLMs (Last Updated: {TODAY'S_DATE} - AI Assisted Review)
 
-This document provides a detailed breakdown of the Voxel Explorer game project, based on its codebase, technical specification, and recent refactoring efforts.
+This document provides a detailed breakdown of the Voxel Explorer game project, based on its codebase, technical specification, and current implementation status.
 
 0. Vision & Scope
-A hyper-performant, desktop-web, top-down voxel game with procedurally generated terrain. Targets 60 FPS on mid-range hardware with server-side authoritative physics at 30 Hz. MVP focuses on exploration, mining, and building.
+A hyper-performant, desktop-web voxel game with procedurally generated terrain. The authoritative server simulates physics (target 30 Hz), and the client targets 60 FPS. MVP focuses on exploration, mining, and building. Future scope includes multiplayer (up to 10 players), resources, and combat.
 
 1. Core Technologies
-   - Rendering: Three.js (WebGL2)
-   - Physics: Rapier3D (WASM, server-side)
-   - Networking: Raw WebSockets (Client: native WebSocket, Server: 'ws' library)
-   - Language: TypeScript
-   - ECS: 'bitecs' library
-   - Bundling/Dev: Vite
+   - Rendering: Three.js (WebGL2) using `vite` for bundling.
+   - Physics: Server-side authoritative with Rapier3D (WASM). Client-side movement prediction and reconciliation.
+   - Networking: Raw WebSockets (Client: native `WebSocket`, Server: `'ws'` library). JSON for messages (FlatBuffers planned).
+   - Language: TypeScript.
+   - ECS: `'bitecs'` library for client-side entity and component management.
+   - World Generation: Web Workers for noise (`fast-simplex-noise`) and meshing.
 
-2. Project Structure (Primary Directories in `src/`)
+2. Project Structure (`src/`)
 
-   - `main.tsx`: Main client-side entry point. Initializes Three.js, ECS world and systems, game loop, managers, debug UI. Manages the main animation loop calling ECS systems.
-   - `ecs/`: Entity Component System.
-     - `world.ts`: `bitecs` world creation, `Transform` component definition (position, rotation, scale).
-     - `types.ts`: Shared ECS types, e.g., `CameraMode`.
+   - `main.tsx`: Main client-side entry point. Initializes Three.js scene, ECS world, systems, game loop, core managers (`ChunkManager`, `NetworkManager`, `NoiseManager`, `MesherManager`), debug UI, and global event listeners (keyboard, mouse for interactions).
+   - `ecs/`: Entity Component System (client-side).
+     - `world.ts`: Defines `bitecs` world factory (`createECSWorld`) and the core `Transform` component (position, rotation, scale).
+     - `types.ts`: Contains shared ECS types (e.g., `CameraMode`).
      - `components/`:
-       - `CameraTarget.ts`: Defines `CameraTarget` component (mode, zoom, pitch, yaw) for entities the camera should focus on or be controlled by.
+       - `CameraTarget.ts`: Defines the `CameraTarget` component (mode, zoom, pitch, yaw) for entities the camera should follow or be controlled by.
      - `systems/`:
-       - `transformSystem.ts`: Syncs ECS `Transform.position` to Three.js `Object3D.position` (and potentially rotation/scale in future). Manages a map of entity IDs to `Object3D` instances.
-       - `CameraSystem.ts`: Initializes and manages the main `THREE.PerspectiveCamera` and a pivot `Object3D`. Updates camera position/rotation based on `CameraTarget` (FPS logic implemented for C4; TPS and lerping pending C5-C7).
-       - `inputLookSystem.ts`: Listens for `mousemove` events when pointer is locked. Updates `CameraTarget.yaw` and `CameraTarget.pitch` for FPS mode (TPS mode updates pending C5).
-       - `PlayerMovementSystem.ts`: Listens for keyboard inputs (WASD, Space, Shift, F, Arrows). Updates the player entity's `Transform.position` based on these inputs and `CameraTarget.yaw`. Includes flying/ground mode toggle and basic gravity/jump for ground mode. Prevents default browser key actions.
-   - `world/`: Core voxel world logic.
-     - `Chunk.ts`: Defines `CHUNK_SIZE`, `LOD_CHUNK_SIZE`. `Chunk` class stores voxel data (`Uint8Array`), manages LOD-specific dimensions, provides RLE compression/decompression, and heightmap access.
-     - `noiseWorker.ts`: Web worker using `fast-simplex-noise` for deterministic procedural terrain generation.
-     - `NoiseManager.ts`: Manages `noiseWorker.ts`.
-     - `mesherWorker.ts`: Web worker for generating chunk meshes (block-by-block).
-     - `MesherManager.ts`: Manages `mesherWorker.ts`.
-     - `ChunkManager.ts`: Orchestrates chunk loading/unloading, LOD, and meshing. Provides `getHeightAtPosition` which is crucial for player-terrain interaction. Stores chunk heightmaps.
+       - `transformSystem.ts`: Syncs ECS `Transform` (position, rotation) to Three.js `Object3D` properties. Manages a map (`object3DMap`) of entity IDs to `Object3D` instances.
+       - `CameraSystem.ts`: Manages the main `THREE.PerspectiveCamera` and its pivot `Object3D`. Updates camera based on `CameraTarget` of the player entity. Implements FPS and basic TPS camera logic.
+       - `inputLookSystem.ts`: Listens for `mousemove` (when pointer locked) and updates `CameraTarget.yaw` and `CameraTarget.pitch` for the player entity.
+       - `PlayerMovementSystem.ts`: Handles keyboard inputs (WASD, Space, Shift, Arrows, F for fly toggle). Updates the player entity's `Transform.position` based on inputs, `CameraTarget.yaw`, and delta time. Implements ground mode (gravity, jump using `ChunkManager.getHeightAtPosition`) and flying mode.
+   - `world/`: Client-side voxel world logic.
+     - `Chunk.ts`: Defines `CHUNK_SIZE`, `LOD_CHUNK_SIZE`, `LODLevel`. `Chunk` class stores voxel data (`Uint8Array`), manages LOD-specific dimensions, and provides heightmap access. (RLE compression mentioned in old overview, current status needs verification in code).
+     - `noiseWorker.ts`: Web Worker using `fast-simplex-noise` for deterministic procedural terrain generation based on chunk coordinates and LOD level. Outputs voxel data and heightmap.
+     - `NoiseManager.ts`: Manages `noiseWorker.ts` for asynchronous chunk data generation.
+     - `mesherWorker.ts`: Web Worker for generating chunk meshes (simple block-by-block, face culling). (Greedy meshing is a TODO).
+     - `MesherManager.ts`: Manages `mesherWorker.ts` for asynchronous mesh generation.
+     - `ChunkManager.ts`: Orchestrates client-side chunk loading/unloading, LOD switching based on distance and hysteresis, and meshing. Manages `Chunk` data and `THREE.Mesh` instances. Provides `getHeightAtPosition` for player-terrain interaction and `setBlock` for client-side prediction of block changes.
    - `net/`: Client-side networking.
-     - `WebSocketClient.ts`: Manages WebSocket connection.
-     - `types.ts`: Defines network-related types (e.g., `ClientCommand`, connection states). Note: distinct from `src/ecs/types.ts`.
-     - `InputHandler.ts`: Previously captured all input. Now, its role in direct player movement/look control is superseded by ECS systems (`inputLookSystem`, `PlayerMovementSystem`). May still be used for other non-ECS inputs or could be refactored/removed if all input becomes ECS-driven.
-     - `NetworkManager.ts`: Coordinates client-side networking. Constructor now accepts ECS `world` and `playerEntityId`. `setupMessageHandler` updates the player entity's `Transform` based on server `stateUpdate` messages. Client-side prediction for camera/player movement via direct manipulation has been removed in favor of ECS updates.
-   - `server/`: Server-side logic (largely unchanged by recent client refactor).
-     - `matchServer.ts`: Main server application.
-     - `physics.ts`: Rapier3D physics wrapper.
-     - `types.ts`: Server-side data structures. Note: distinct from client-side `types.ts` files.
-   - `scenes/`: Exists but is currently empty.
-   - `main.ts`: Legacy entry point, likely from project scaffolding phase.
-   - (Still Missing from `src/` but in spec): `render/`, `utils/`.
+     - `WebSocketClient.ts`: Manages the WebSocket connection, sending commands (currently JSON, FlatBuffers planned) and receiving messages from the server.
+     - `types.ts`: Defines client-side network-related types (e.g., `ClientCommand`, `ClientCommandType`, connection states).
+     - `InputHandler.ts`: Captures mouse delta for look controls. Its broader role for other inputs seems to be superseded by ECS systems.
+     - `NetworkManager.ts`: Coordinates client-side networking.
+       - Constructor takes ECS `world`, `playerEntityId`, `movementSystemControls` (for current input state), and `chunkManager` (for prediction and block updates).
+       - `setupMessageHandler`: Handles server messages:
+         - `stateUpdate`: Updates player entity's `Transform` (position, rotation) to server state. Implements client-side prediction reconciliation by removing acknowledged inputs from `pendingInputs` and replaying subsequent inputs using `calculatePlayerMovement`.
+         - `blockUpdate`: Updates chunk data via `ChunkManager.setBlock` based on server-confirmed block changes.
+         - `mineError`/`placeError`: Logs errors from server.
+       - `sendMineCommand`/`sendPlaceCommand`: Sends block modification requests to the server.
+       - `startCommandLoop`: Periodically sends `PLAYER_INPUT` commands to the server (30 Hz) containing current key states, mouse deltas, and camera yaw. Stores these inputs in `pendingInputs` for reconciliation.
+   - `server/`: Server-side logic.
+     - `matchServer.ts`: Main server application using Express and `ws` for WebSockets.
+       - Initializes Rapier physics (`createPhysicsWorld`).
+       - Manages `MatchState` (players, chunks).
+       - Handles client connections, assigns player IDs.
+       - `handleMessage`: Processes client commands:
+         - `PLAYER_INPUT`: Updates `lastProcessedInputSeq` for the player. (Full physics-based movement update is a TODO).
+         - `MINE_BLOCK`/`PLACE_BLOCK`: Validates commands (bounds, basic checks), updates server-side chunk data (`getBlock`/`setBlock` helpers), and broadcasts `blockUpdate` messages to all clients. Sends `mineError`/`placeError` on failure.
+       - Periodically broadcasts game state to clients (TODO: `broadcastState` function seems to be defined but not called in the provided snippet).
+     - `physics.ts`: Wrapper for Rapier3D initialization (`initRapier`, `createPhysicsWorld`). (Detailed physics simulation loop and entity management not fully shown in snippet).
+     - `types.ts`: Defines server-side data structures (e.g., `MatchState`, `Player`, `Chunk`).
+   - `render/`: Client-side rendering utilities.
+     - `Highlight.ts`: `VoxelHighlighter` class to render a wireframe box around a targeted voxel using `THREE.LineSegments`. Used in `main.tsx`.
+   - `utils/`: Client-side utility functions.
+     - `raycastVoxel.ts`: Implements voxel raycasting (DDA algorithm) to convert screen clicks/center screen to voxel coordinates and face normals. Used for block interaction.
+   - `scenes/`: Exists but appears empty or unused.
+   - `main.ts`: Legacy entry point, likely from scaffolding. `main.tsx` is the current primary entry point.
+   - `style.css`: Basic CSS.
 
 3. Key Game Mechanics & Systems Status
 
-   - ECS & Scene Graph: `bitecs` for ECS, Three.js for rendering. `transformSystem` links ECS position to Three.js object positions. Player entity has `Transform` and `CameraTarget`.
-   - Camera Control:
-     - `CameraSystem.ts` creates and owns the main `THREE.PerspectiveCamera` and its pivot. It now implements basic FPS camera logic (C4), updating the camera based on the player entity's `Transform` and `CameraTarget` (yaw/pitch).
-     - `inputLookSystem.ts` updates `CameraTarget.yaw` and `CameraTarget.pitch` from mouse input for FPS mode.
-     - `PlayerMovementSystem.ts` uses `CameraTarget.yaw` to determine movement direction.
-     - Direct camera manipulation in `main.tsx` and `NetworkManager.ts` has been removed.
-     - TPS camera mode, lerping, and camera collision/occlusion are pending (C5-C7).
-   - Player Movement:
-     - `PlayerMovementSystem.ts` handles keyboard input for movement (WASD, Space, Shift) and flying/ground mode toggle (F).
-     - Calculates movement based on player speed constants, `CameraTarget.yaw`, and delta time.
-     - Ground mode includes gravity and jump logic, using `ChunkManager.getHeightAtPosition` for terrain collision.
-   - Terrain Generation & Chunk Management: Largely unchanged. `ChunkManager.getHeightAtPosition` now critical for player physics.
-   - Networking:
-     - `NetworkManager` updated to integrate with ECS for applying server state to the player entity's `Transform`.
-     - Old client-side prediction via direct camera manipulation in `NetworkManager` is removed.
-   - (Other items like Meshing, Rendering details, Server-side Physics, etc., remain largely as before unless specified above).
+   - ECS & Scene Graph: `bitecs` for client-side ECS. Three.js for rendering.
+     - Player entity has `Transform`, `CameraTarget`, and `Object3DRef` (links to `playerModelMesh`).
+     - `transformSystem` syncs ECS `Transform` to Three.js `Object3D`s.
+   - Camera Control (Client):
+     - `CameraSystem` updates the main camera based on player's `Transform` and `CameraTarget` (yaw/pitch for FPS, zoom/pitch/yaw for TPS).
+     - `inputLookSystem` updates `CameraTarget.yaw` and `CameraTarget.pitch` from mouse input.
+     - `PlayerMovementSystem` uses `CameraTarget.yaw` for movement direction.
+     - Basic FPS and TPS modes are implemented. Lerping and advanced collision/occlusion are pending (Tech Spec C6-C7).
+   - Player Movement (Client & Server):
+     - Client: `PlayerMovementSystem` handles keyboard input, calculates intended movement (including gravity/jump in ground mode using `ChunkManager.getHeightAtPosition`), and updates local `Transform`. Flying mode implemented.
+     - Client: `NetworkManager` sends input commands, performs client-side prediction by replaying inputs after receiving server state, and snaps to server state.
+     - Server: `matchServer.ts` receives inputs. Basic position updates based on input are present; full server-side physics simulation with Rapier for player movement is a major TODO.
+   - Terrain Generation & Chunk Management (Client):
+     - `ChunkManager` loads/unloads chunks and manages LODs (HIGH/LOW) based on distance to player.
+     - `NoiseManager` + `noiseWorker` generate chunk voxel data procedurally.
+     - `MesherManager` + `mesherWorker` generate simple block-by-block meshes. Greedy meshing is a TODO.
+     - `ChunkManager.getHeightAtPosition` is used for ground collision by `PlayerMovementSystem`.
+   - Networking (Client/Server):
+     - `NetworkManager` (client) communicates with `matchServer.ts` (server) via WebSockets using JSON messages.
+     - Client-side prediction and server reconciliation for player movement is implemented.
+     - Authoritative server for block mining/placing: client sends command, server validates, updates its state, and broadcasts to all clients.
+     - FlatBuffers for network messages is a TODO.
+   - Block Interaction (Mining/Placing):
+     - Client: `raycastVoxel` determines target block. `VoxelHighlighter` shows selection.
+     - Client: `main.tsx` handles mouse clicks to initiate mine/place actions, calling `NetworkManager.sendMineCommand` or `sendPlaceCommand`.
+     - Client: `ChunkManager.setBlock` is used for optimistic local updates on block placement (though server is authoritative).
+     - Server: `matchServer.ts` validates and executes block changes, then broadcasts.
+   - Server-Side Physics:
+     - Rapier3D is initialized on the server (`physics.ts`, `matchServer.ts`).
+     - TODO: Full integration of Rapier for authoritative player movement, collision detection, and other physics-driven interactions.
 
-4. Notable Discrepancies from Spec / TODOs:
+4. Notable Discrepancies from Tech Spec / TODOs (Prioritized):
 
-   - (Items like FlatBuffers, Greedy Meshing, Texture Atlas, Advanced State Sync, Server Game Logic, Missing Directories remain relevant TODOs from previous state).
-   - Camera System Implementation (Refactor Tasks C5-C7):
-     - C5: Implement basic Third-Person (TPS) camera logic. This includes:
-       - `CameraSystem.ts`: Update for TPS mode using `CameraTarget.zoom`, `pitch`, `yaw`.
-       - `InputLookSystem.ts`: Handle mouse input (X, Y, Wheel) for TPS yaw, pitch, and zoom control.
-       - `main.tsx` (or similar): Implement a key to toggle between FPS and TPS modes.
-     - C6: Implement smooth camera movement (lerping) for both FPS and TPS modes in `CameraSystem.ts`.
-     - C7: Implement basic camera collision detection and occlusion handling in `CameraSystem.ts` (e.g., prevent camera from clipping through walls, zoom in if occluded).
-   - Player Input Handling: `InputHandler.ts` in `src/net/` might need review. Its original purpose of collecting all inputs (including movement/look) is now handled by `PlayerMovementSystem` and `InputLookSystem`. Determine if it's still needed for other commands or should be phased out/refactored for a unified ECS-based input approach.
+   1.  **Server-Side Physics & Player Movement (High Priority):**
+       -   Tech Spec: Authoritative server simulates physics at 30 Hz.
+       -   Current: `matchServer.ts` has basic input handling but lacks full Rapier physics integration for player movement, collision, and state updates. `PlayerMovementSystem.ts` on client is more advanced.
+       -   Recommendation: Implement server-side player entity management, apply inputs to physics bodies, step Rapier world, and broadcast authoritative states.
 
-5. Key Issues & Recommendations (Priority Order)
+   2.  **Networking - FlatBuffers & Optimization (Medium-High Priority):**
+       -   Tech Spec: FlatBuffers for binary data, chunk diff LZ4 (post-MVP).
+       -   Current: JSON messaging. `WebSocketClient.ts` has a TODO for FlatBuffers.
+       -   Recommendation: Implement FlatBuffers for all client-server communication to reduce bandwidth and parsing overhead.
 
-   1. Player Spawning Underground & Movement Issues (RESOLVED):
-      - Issue: Player was spawning underground and camera was static.
-      - Resolution: `CameraSystem.ts` now correctly updates the camera based on player `Transform` and `CameraTarget` for FPS mode. `PlayerMovementSystem.ts` correctly handles keyboard input and applies movement. Initial spawn height and flying mode allow player to start correctly.
+   3.  **Meshing - Greedy Meshing (Medium Priority):**
+       -   Tech Spec: Greedy mesher worker (SURF algorithm).
+       -   Current: `mesherWorker.ts` uses a simple block-by-block approach.
+       -   Recommendation: Implement greedy meshing to significantly reduce vertex count and improve rendering performance.
 
-   2. Camera System Refinements (C5-C7 - Next Steps - see section 4 for details).
-   3. Server-Side Game Logic Implementation (Core Gameplay Blocker - As before).
-   4. Greedy Meshing Implementation (Performance & Spec Adherence - As before).
-   5. FlatBuffers for Network Communication (Performance & Spec Adherence - As before).
+   4.  **Chunk Management & Rendering (Medium Priority):**
+       -   Tech Spec: Texture Atlas & Renderer, frustum culling, LOD swap refinement.
+       -   Current: Basic chunk rendering with shared material. `ChunkManager` has LOD logic. Frustum culling in `ChunkManager.getVisibleChunks` is basic. Texture atlas not explicitly seen.
+       -   Recommendation: Implement texture atlas for varied block types. Improve chunk rendering and culling. Refine LOD transitions.
 
-(Timestamp and versioning for this document to be maintained going forward) 
+   5.  **Camera System Refinements (Medium Priority - Tech Spec C5-C7):**
+       -   C5 (TPS): Basic TPS is in `CameraSystem.ts`. `InputLookSystem` needs TPS mouse handling (zoom). `main.tsx` needs FPS/TPS toggle key.
+       -   C6 (Lerping): Smooth camera movement for FPS/TPS is pending.
+       -   C7 (Collision/Occlusion): Camera collision and occlusion handling is pending.
+       -   Recommendation: Implement these refinements in `CameraSystem.ts` and `InputLookSystem.ts`.
+
+   6.  **Lobby Lifecycle & Match Management (Medium Priority - Tech Spec M5):**
+       -   Tech Spec: Lobby registry, /create endpoint, WebSocket handshake with lobby ID, heartbeats, reconnect logic, auto-terminate empty lobby.
+       -   Current: `matchServer.ts` is a single match instance. No lobby system or multi-match management. Basic player connect/disconnect.
+       -   Recommendation: Implement the lobby system as per M5 tasks.
+
+   7.  **Player Input Handling - `InputHandler.ts` Review (Low-Medium Priority):**
+       -   Current: `InputHandler.ts` role seems reduced. `PlayerMovementSystem` and `InputLookSystem` handle primary game inputs.
+       -   Recommendation: Review `InputHandler.ts`. Consolidate input logic into ECS systems if possible, or clarify its specific remaining responsibilities (e.g., UI interactions not tied to ECS).
+
+   8.  **World Persistence & Data (Low Priority for MVP):**
+       -   Tech Spec: "Persistence / $: None" for MVP.
+       -   Current: No persistence. Server `matchState` is in-memory.
+       -   Recommendation: This is fine for MVP.
+
+   9.  **Missing Directories from Spec (Low Priority):**
+       -   `src/render/` is partially present (`Highlight.ts`). More components like shaders, chunk renderer, atlas management are expected per spec.
+       -   `src/utils/` is present (`raycastVoxel.ts`).
+       -   Recommendation: Organize rendering code into `src/render/` as it develops.
+
+   10. **RLE Compression for Chunks (Low Priority):**
+        -  `Chunk.ts` mentions RLE in old overview, but current implementation detail for compression/decompression needs verification if it exists or is used.
+        - Tech Spec mentions chunk diff optionally LZ4 (post-MVP).
+        - Recommendation: Confirm if RLE is actively used for chunk data. Consider LZ4 for diffs later.
+
+5. Key Issues & Recommendations (Overall Priority Order - Combining above with general observations):
+
+   1.  **Server-Side Authoritative Player Movement & Physics (CRITICAL):** The largest gap for core gameplay. Implement full Rapier physics on the server for player movement, collisions, and state updates. (Corresponds to #1 in TODOs)
+   2.  **Networking Enhancements - FlatBuffers (HIGH):** Essential for performance and scalability as per tech spec. (Corresponds to #2 in TODOs)
+   3.  **Greedy Meshing (HIGH):** Critical for client rendering performance with larger views or more complex chunks. (Corresponds to #3 in TODOs)
+   4.  **Lobby & Match Management (MEDIUM-HIGH):** Required for multiplayer matches as envisioned in tech spec. (Corresponds to #6 in TODOs)
+   5.  **Camera System Refinements (MEDIUM):** Polish player experience (TPS controls, lerping, collision). (Corresponds to #5 in TODOs)
+   6.  **Chunk Rendering & Texture Atlas (MEDIUM):** Improve visual fidelity and performance. (Corresponds to #4 in TODOs)
+   7.  **Server Stability & State Broadcasting (MEDIUM):** Ensure `broadcastState` is robustly implemented and called in `matchServer.ts`. Solidify error handling and resource management on the server.
+   8.  **Code Cleanup & Refinement (ONGOING):**
+       - Review `InputHandler.ts` role.
+       - Ensure consistency in client/server constants (chunk sizes, etc.).
+       - Address any remaining client-side prediction inaccuracies, especially around `yVelocity` in `NetworkManager.ts` reconciliation. The comment "This is a known simplification for now" regarding yVelocity implies it's an area for improvement.
+
+(This document should be regularly updated as the project evolves. Timestamp and versioning are recommended.) 
