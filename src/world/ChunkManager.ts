@@ -705,12 +705,12 @@ export class ChunkManager {
             console.warn(`Re-mesh for chunk ${key} resulted in empty mesh. Original block: ${worldX},${worldY},${worldZ}`);
         }
         // If mesh is empty, remove old mesh and its entry from loadedChunks
-        if (oldChunkMeshDetails && oldChunkMeshDetails.mesh) {
-          if (oldChunkMeshDetails.mesh.parent) {
-            this.scene.remove(oldChunkMeshDetails.mesh);
-          }
-          oldChunkMeshDetails.mesh.geometry.dispose();
-          this.loadedChunks.delete(key); 
+      if (oldChunkMeshDetails && oldChunkMeshDetails.mesh) {
+        if (oldChunkMeshDetails.mesh.parent) {
+          this.scene.remove(oldChunkMeshDetails.mesh);
+        }
+        oldChunkMeshDetails.mesh.geometry.dispose();
+            this.loadedChunks.delete(key);
         }
         return true; 
       }
