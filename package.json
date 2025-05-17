@@ -28,6 +28,7 @@
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.11.2",
     "@types/stats.js": "^0.17.4",
+    "alea": "^1.0.1",
     "bitecs": "^0.3.40",
     "express": "^4.18.3",
     "fast-simplex-noise": "^4.0.0",
