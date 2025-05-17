@@ -12,6 +12,7 @@ import { getBlock, setBlock } from './world/voxelIO.js'; // Import from new loca
 import { chunkKey } from './world/chunkUtils.js'; // For pre-warming key gen
 import { getOrCreateChunk } from './world/getOrCreateChunk.js'; // Corrected import path
 import { buildChunkColliders } from './physics/buildChunkColliders.js'; // S2-1 Import
+import { sweepInactiveChunks } from './world/chunkGC.js'; // S2-2 Import sweepInactiveChunks
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -469,6 +470,8 @@ async function startServer() {
   // Game loop
   const TICK_RATE = 1000 / 30;
   const MAX_COLLIDERS_PER_TICK = 2000; // Max colliders to create per game tick
+  let gcTimer = 0; // S2-2 GC Timer
+  const GC_INTERVAL_TICKS = 150; // Every 5 seconds at 30Hz (150 ticks)
 
   setInterval(() => {
     const now = Date.now();
@@ -503,9 +506,21 @@ async function startServer() {
       // console.warn('[Physics/Tick] Physics world not available for step.');
     }
     
-    matchState.lastUpdate = now;
-    
+    // 3. Broadcast state
     broadcastState(wss, matchState);
+
+    // 4. Chunk Garbage Collection (S2-2)
+    if ((gcTimer += 1) >= GC_INTERVAL_TICKS) { 
+      if (matchState.physicsWorld && matchState.physicsWorld.raw) {
+        // console.log('[Server/Tick] Running chunk GC sweep...');
+        sweepInactiveChunks(matchState.physicsWorld.raw, matchState /*, matchState.seed // Seed not used by sweep */);
+      } else {
+        console.warn('[Server/Tick] Cannot run chunk GC: physics world not available.');
+      }
+      gcTimer = 0;
+    }
+
+    matchState.lastUpdate = now;
   }, TICK_RATE);
 
   // Broadcast state to all connected clients
@@ -513,7 +528,7 @@ async function startServer() {
     const stateUpdatePayload = {
       type: 'stateUpdate',
       state: { 
-          players: Object.fromEntries(matchState.players),
+          players: Object.fromEntries(matchState.players.entries()),
           // Do not send full chunk data in regular state updates unless necessary
       }
     };

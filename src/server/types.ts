@@ -1,5 +1,6 @@
 import { WebSocket } from 'ws';
 import type { PhysicsWorld } from './physics.js';
+export type { PhysicsWorld };
 
 // Duplicated from client src/net/types.ts to avoid pathing issues with server's rootDir
 export enum ClientCommandType {
