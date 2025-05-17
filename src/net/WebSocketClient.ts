@@ -36,12 +36,15 @@ export class WebSocketClient {
     if (!this.ws) return;
 
     this.ws.onopen = () => {
-      console.log('WebSocket connected');
+      console.log('[WebSocketClient] WebSocket connected. Firing onOpenCallback.');
       this.connectionState.isConnected = true;
       this.connectionState.reconnectAttempts = 0;
       this.connectionState.lastReconnectTime = Date.now();
       if (this.onOpenCallback && this.ws) {
+        console.log('[WebSocketClient] onOpenCallback is present, calling it.');
         this.onOpenCallback(this.ws);
+      } else {
+        console.log('[WebSocketClient] onOpenCallback is NOT present or ws is null.');
       }
     };
 

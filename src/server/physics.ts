@@ -1,6 +1,7 @@
 import * as RAPIER from '@dimforge/rapier3d-compat';
 
 export interface PhysicsWorld {
+  raw: RAPIER.World;
   step(): void;
   addRigidBody(body: RAPIER.RigidBodyDesc): RAPIER.RigidBody;
   removeRigidBody(body: RAPIER.RigidBody): void;
@@ -23,6 +24,7 @@ export function createPhysicsWorld(): PhysicsWorld {
   const world = new rapier.World(gravity);
 
   return {
+    raw: world,
     step() {
       world.step();
     },

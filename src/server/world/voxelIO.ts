@@ -5,14 +5,14 @@ import { CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z } from '../../shared/constants
 // DEFAULT_WORLD_SEED is no longer needed here as seed is passed in.
 
 // Helper function to get a block from server's chunk data
-export function getBlock(state: IServerMatchState, seed: number, wx: number, wy: number, wz: number): number {
+export async function getBlock(state: IServerMatchState, seed: number, wx: number, wy: number, wz: number): Promise<number> {
   // Validate world Y coordinate first
   if (wy < 0 || wy >= CHUNK_SIZE_Y) return 0; // Return air for out-of-bounds Y
 
   const cx = Math.floor(wx / CHUNK_SIZE_X);
   const cz = Math.floor(wz / CHUNK_SIZE_Z);
 
-  const chunk = getOrCreateChunk(state, seed, cx, cz);
+  const chunk = await getOrCreateChunk(state, seed, cx, cz);
 
   // Calculate local coordinates within the chunk
   const lx = ((wx % CHUNK_SIZE_X) + CHUNK_SIZE_X) % CHUNK_SIZE_X;
@@ -29,13 +29,13 @@ export function getBlock(state: IServerMatchState, seed: number, wx: number, wy:
 }
 
 // Helper function to set a block in server's chunk data
-export function setBlock(state: IServerMatchState, seed: number, wx: number, wy: number, wz: number, id: number): boolean {
+export async function setBlock(state: IServerMatchState, seed: number, wx: number, wy: number, wz: number, id: number): Promise<boolean> {
   if (wy < 0 || wy >= CHUNK_SIZE_Y) return false; // Return false if out-of-bounds Y
 
   const cx = Math.floor(wx / CHUNK_SIZE_X);
   const cz = Math.floor(wz / CHUNK_SIZE_Z);
 
-  const chunk = getOrCreateChunk(state, seed, cx, cz);
+  const chunk = await getOrCreateChunk(state, seed, cx, cz);
   // If getOrCreateChunk itself could fail and return null/undefined, we'd check here.
   // Assuming it always returns a valid Chunk or throws (which would be caught by a higher level).
 

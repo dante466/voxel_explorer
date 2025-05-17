@@ -56,8 +56,12 @@ export class NetworkManager {
 
     // Provide onOpen callback to WebSocketClient
     this.wsClient = new WebSocketClient(serverUrl, (socket) => {
+      console.log('[NetworkManager] onOpenCallback received from WebSocketClient.');
       if (this.chunkManager) {
+        console.log('[NetworkManager] chunkManager found, calling chunkManager.setSocket.');
         this.chunkManager.setSocket(socket);
+      } else {
+        console.warn('[NetworkManager] chunkManager NOT found when onOpenCallback fired.');
       }
     });
 

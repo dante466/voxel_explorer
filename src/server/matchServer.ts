@@ -11,6 +11,7 @@ import { testS1_1_HeightmapConsistency } from './world/chunkValidation.js'; // S
 import { getBlock, setBlock } from './world/voxelIO.js'; // Import from new location
 import { chunkKey } from './world/chunkUtils.js'; // For pre-warming key gen
 import { getOrCreateChunk } from './world/getOrCreateChunk.js'; // Corrected import path
+import { buildChunkColliders } from './physics/buildChunkColliders.js'; // S2-1 Import
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -35,6 +36,8 @@ const DEFAULT_WORLD_SEED = 12345;
 interface MatchState extends IMatchState {
   ecsWorld: ServerECSWorld;
   seed: number;
+  physicsWorld: ReturnType<typeof createPhysicsWorld>;
+  pendingColliders: (() => void)[];
 }
 
 const matchStateStore = new Map<string, MatchState>();
@@ -94,43 +97,57 @@ async function startServer() {
     lastUpdate: Date.now(),
     ecsWorld: ecsWorld, // Add ecsWorld to matchState
     seed: DEFAULT_WORLD_SEED, // Initialize seed in matchState
+    physicsWorld: physicsWorld, // Assign physicsWorld
+    pendingColliders: [], // Initialize pendingColliders
   };
 
-  // S1-2: Pre-warm initial chunks
-  /*
-  console.log('[Server] S1-2: Pre-warming initial 3x3 chunks around (0,0)...');
+  // S1-2 & S2-1: Pre-warm initial 3x3 chunk area and queue colliders
+  console.log('[Server/Pre-warm] Pre-warming 3x3 chunk area around (0,0) and queueing colliders...');
   const s12_startTime = performance.now();
-  let s12_chunksGenerated = 0;
-  for (let cx = -1; cx <= 1; cx++) {
-    for (let cz = -1; cz <= 1; cz++) {
-      try {
-        const chunkData = genChunk(matchState.seed, cx, cz);
-        const cKey = chunkKey(cx, cz); // Use chunkKey utility
-        matchState.chunks.set(cKey, {
-          x: cx,
-          z: cz,
-          data: chunkData.voxels,
-          lastModified: chunkData.lastModified, // Assume lastModified is already a number
-        });
-        console.log(`[Server] S1-2: Generated chunk ${cKey}`);
-        s12_chunksGenerated++;
-      } catch (error) {
-        console.error(`[Server] S1-2: Error generating chunk ${cx},${cz}:`, error);
-      }
+  let s12_chunksProcessed = 0; // Renamed from s12_chunksGenerated
+  let totalCollidersQueued = 0; // Changed from totalCollidersCreated
+
+  const preWarmRadius = 1; // For a 3x3 area (-1 to 1)
+  const preWarmPromises: Promise<void>[] = []; // Changed to Promise<void> as getOrCreateChunk might not need to return chunk for this specific summing purpose if count is handled differently
+
+  for (let cx = -preWarmRadius; cx <= preWarmRadius; cx++) {
+    for (let cz = -preWarmRadius; cz <= preWarmRadius; cz++) {
+      preWarmPromises.push(
+        getOrCreateChunk(matchState, matchState.seed, cx, cz)
+          .then(chunk => { // chunk is still returned by getOrCreateChunk
+            if (chunk) {
+              s12_chunksProcessed++;
+              // The count of colliders is now determined by buildChunkColliders' return or inspection of pendingColliders queue length change
+              // For simplicity in pre-warm, we assume getOrCreateChunk correctly triggers buildChunkColliders,
+              // which in turn populates pendingColliders. We'll log the queue size after all calls.
+              console.log(`[Server/Pre-warm] Chunk (${cx},${cz}) processed for collider queuing.`);
+            } else {
+              console.error(`[Server/Pre-warm] Failed to get or create chunk (${cx},${cz}) during pre-warm.`);
+            }
+          })
+          .catch(error => {
+            console.error(`[Server/Pre-warm] Error processing chunk (${cx},${cz}) for collider queuing:`, error);
+          })
+      );
     }
   }
+
+  // Wait for all chunk generation and collider queuing to be initiated
+  await Promise.all(preWarmPromises);
+  
+  totalCollidersQueued = matchState.pendingColliders.length; // Get total from the queue itself
+
   const s12_endTime = performance.now();
   const s12_duration = s12_endTime - s12_startTime;
-  console.log(`[Server] S1-2: Pre-warmed ${s12_chunksGenerated} chunks in ${s12_duration.toFixed(2)} ms.`);
-  if (s12_chunksGenerated === 9 && s12_duration < 200) {
-    console.log('[Server] S1-2 Success: Chunk pre-warming completed successfully and within 200ms.');
-  } else if (s12_chunksGenerated === 9) {
-    console.warn(`[Server] S1-2 Performance: Chunk pre-warming took ${s12_duration.toFixed(2)}ms (target < 200ms).`);
+  console.log(`[Server/Pre-warm] Finished processing ${s12_chunksProcessed} chunk(s) for collider queuing in ${s12_duration.toFixed(2)} ms.`);
+  console.log(`[Physics] Queued ${totalCollidersQueued} terrain colliders during pre-warm.`); // Updated log
+
+  if (s12_chunksProcessed === (preWarmRadius * 2 + 1) ** 2) {
+    console.log('[Server/Pre-warm] Success: All expected initial chunks processed for queuing.');
   } else {
-    console.error('[Server] S1-2 Failed: Not all 9 chunks were generated.');
+    console.warn(`[Server/Pre-warm] Warning: Expected ${(preWarmRadius * 2 + 1) ** 2} chunks for queuing, but processed ${s12_chunksProcessed}.`);
   }
-  */
-  // End S1-2 Pre-warming
+  // End S1-2 & S2-1 Pre-warming
 
   let nextPlayerNumericId = 1; // For ECS NetworkId
 
@@ -214,7 +231,8 @@ async function startServer() {
   });
 
   // Message handler
-  function handleMessage(ws: WebSocket, message: any, matchState: MatchState, wssInstance: WebSocketServer) {
+  // NOW ASYNC to handle await for getOrCreateChunk
+  async function handleMessage(ws: WebSocket, message: any, matchState: MatchState, wssInstance: WebSocketServer) {
     const cmdPlayerId = getPlayerIdForWebSocket(ws, matchState);
     console.log(`[Server] Received message:`, message, `from player: ${cmdPlayerId}`); // Log all incoming messages
 
@@ -226,38 +244,48 @@ async function startServer() {
         const { cx, cz, seq } = message; // Assume client sends cx, cz, and optional seq
 
         if (typeof cx !== 'number' || typeof cz !== 'number') {
-          console.error(`[Server] Invalid chunkRequest: missing coordinates. cx=${cx}, cz=${cz}`);
-          sendError(ws, 'chunkResponseError', seq, 'InvalidCoordinates', 'Missing chunk coordinates.');
-          break;
+          console.error(`[Server] Invalid chunkRequest: cx or cz missing or not numbers.`, message);
+          // Use the generic sendError helper if applicable, or craft specific response
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'chunkResponseError',
+              seq: seq, // Include seq if client sent it
+              // cx and cz are not known/valid here, so cannot include them
+              code: 'BadRequest',
+              reason: 'Invalid chunkRequest: cx and/or cz missing or not numbers.'
+            }));
+          }
+          return;
         }
 
-        // Validate chunk coordinates (optional, but good practice)
-        // Example: Ensure they are within some reasonable bounds if your world is not infinite.
-        // For now, we'll assume any integer coordinates are valid.
-
-        console.log(`[Server] Chunk request for ${cx},${cz} from player ${cmdPlayerId}`);
         try {
-          // getOrCreateChunk expects the main MatchState and the seed.
-          const chunk = getOrCreateChunk(matchState, matchState.seed, cx, cz);
-
-          if (chunk && chunk.data) {
-            const chunkResponseMessage = {
+          console.log(`[Server/chunkRequest] Processing ASYNC chunkRequest for ${cx},${cz}`);
+          const chunk = await getOrCreateChunk(matchState, matchState.seed, cx, cz); // Await the async function
+          // Convert Uint8Array to a regular array for JSON serialization
+          const voxelsArray = Array.from(chunk.data);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
               type: 'chunkResponse',
               cx: cx,
               cz: cz,
-              voxels: Array.from(chunk.data), // Convert Uint8Array to number[] for JSON
-              seq: seq // Echo back sequence number if provided
-            };
-            ws.send(JSON.stringify(chunkResponseMessage));
-            console.log(`[Server] Sent chunk ${cx},${cz} to player ${cmdPlayerId}`);
-          } else {
-            // This case should ideally not be hit if getOrCreateChunk always returns a valid chunk or throws
-            console.error(`[Server] Failed to get or create chunk ${cx},${cz}. Chunk or chunk.data is null/undefined.`);
-            sendError(ws, 'chunkResponseError', seq, 'ChunkGenerationFailed', `Server failed to provide chunk ${cx},${cz}.`);
+              voxels: voxelsArray,
+              // lodLevel: chunk.lodLevel // Future: if server sends LOD specific data
+            }));
+            console.log(`[Server] Sent chunkResponse for ${cx},${cz} with ${voxelsArray.length} voxels.`);
           }
         } catch (error) {
-          console.error(`[Server] Error processing chunkRequest for ${cx},${cz}:`, error);
-          sendError(ws, 'chunkResponseError', seq, 'InternalServerError', `Error processing chunk ${cx},${cz}.`);
+          console.error(`[Server] Error processing chunk request for ${cx},${cz}:`, error);
+          // Ensure cx and cz are included in the error response for client
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'chunkResponseError',
+              seq: seq, // Include seq if client sent it
+              cx: cx,   // Ensure cx is included
+              cz: cz,   // Ensure cz is included
+              code: 'InternalServerError',
+              reason: `Error processing chunk ${cx},${cz}. Details: ${(error instanceof Error) ? error.message : String(error)}`
+            }));
+          }
         }
         break;
       }
@@ -319,7 +347,7 @@ async function startServer() {
         // TODO: Add more validation (e.g., distance to player, line of sight)
 
         console.log(`Calling server setBlock(${targetVoxelX},${targetVoxelY},${targetVoxelZ}, 0)`);
-        const success = setBlock(matchState, matchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ, 0);
+        const success = await setBlock(matchState, matchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ, 0);
         console.log(`server setBlock success: ${success}`);
 
         if (success) {
@@ -378,13 +406,13 @@ async function startServer() {
         
         // TODO: Add more validation (distance to player, ensure target is air/replaceable)
         // For now, let's assume we can only place in air blocks (getBlock should return 0 or null)
-        const currentBlock = getBlock(matchState, matchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ);
+        const currentBlock = await getBlock(matchState, matchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ);
         if (currentBlock !== 0 && currentBlock !== null) { // Check if block is not air
             sendError(ws, 'placeError', seq, 'BlockOccupied', `Cannot place block at (${targetVoxelX},${targetVoxelY},${targetVoxelZ}), it's occupied by ${currentBlock}.`);
             break;
         }
 
-        const success = setBlock(matchState, matchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ, blockIdToPlace);
+        const success = await setBlock(matchState, matchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ, blockIdToPlace);
 
         if (success) {
             const chunkX = Math.floor(targetVoxelX / CHUNK_SIZE_X);
@@ -440,14 +468,40 @@ async function startServer() {
 
   // Game loop
   const TICK_RATE = 1000 / 30;
+  const MAX_COLLIDERS_PER_TICK = 2000; // Max colliders to create per game tick
+
   setInterval(() => {
     const now = Date.now();
     const delta = now - matchState.lastUpdate;
     matchState.ecsWorld.time.delta = delta / 1000; // Convert ms to seconds
     matchState.ecsWorld.time.elapsed += delta;
     matchState.ecsWorld.time.then = now;
+
+    // 1. Process pending collider additions
+    const collidersToProcessThisTick = Math.min(matchState.pendingColliders.length, MAX_COLLIDERS_PER_TICK);
+    if (collidersToProcessThisTick > 0) {
+      console.log(`[Physics/Tick] Draining ${collidersToProcessThisTick} colliders. Queue size: ${matchState.pendingColliders.length}`);
+    }
+    for (let i = 0; i < collidersToProcessThisTick; i++) {
+      const colliderFunc = matchState.pendingColliders.shift(); // Use shift to process FIFO
+      if (colliderFunc) {
+        try {
+          colliderFunc();
+        } catch (e) {
+          console.error('[Physics/Tick] Error executing collider function from queue:', e);
+        }
+      }
+    }
+    if (collidersToProcessThisTick > 0 && matchState.pendingColliders.length === 0) {
+        console.log('[Physics/Tick] Collider queue drained.');
+    }
     
-    physicsWorld.step();
+    // 2. Step physics safely
+    if (matchState.physicsWorld && matchState.physicsWorld.raw) {
+      matchState.physicsWorld.raw.step();
+    } else {
+      // console.warn('[Physics/Tick] Physics world not available for step.');
+    }
     
     matchState.lastUpdate = now;
     

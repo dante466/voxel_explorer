@@ -1,4 +1,5 @@
 import { WebSocket } from 'ws';
+import type { PhysicsWorld } from './physics.js';
 
 // Duplicated from client src/net/types.ts to avoid pathing issues with server's rootDir
 export enum ClientCommandType {
@@ -22,6 +23,7 @@ export interface Chunk {
   z: number;
   data: Uint8Array;
   lastModified: number;
+  colliderHandles?: number[];
 }
 
 export interface MatchState {
@@ -29,6 +31,8 @@ export interface MatchState {
   chunks: Map<string, Chunk>;
   lastUpdate: number;
   seed: number;
+  physicsWorld?: PhysicsWorld;
+  pendingColliders: (() => void)[];
 }
 
 export type MessageType = 
