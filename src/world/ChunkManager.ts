@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { Chunk, LODLevel } from './Chunk';
+import { Chunk, LODLevel, CHUNK_SIZE } from './Chunk';
 import { NoiseManager } from './NoiseManager';
 import { MesherManager } from './MesherManager';
 
@@ -180,11 +180,12 @@ export class ChunkManager {
       
       // Dispose of geometry and material
       chunkData.mesh.geometry.dispose();
-      if (Array.isArray(chunkData.mesh.material)) {
-        chunkData.mesh.material.forEach(material => material.dispose());
-      } else {
-        chunkData.mesh.material.dispose();
-      }
+      // Material is shared, so we don't dispose it here unless it becomes unique
+      // if (Array.isArray(chunkData.mesh.material)) {
+      //   chunkData.mesh.material.forEach(material => material.dispose());
+      // } else {
+      //   chunkData.mesh.material.dispose();
+      // }
       
       // Remove from internal data structures
       this.loadedChunks.delete(key);
@@ -519,134 +520,6 @@ export class ChunkManager {
     return this.chunkData.get(chunkKey);
   }
 
-  // M4.2: New method to set a block and update the chunk mesh
-  public async setBlock(worldX: number, worldY: number, worldZ: number, blockId: number): Promise<boolean> {
-    const chunkX = Math.floor(worldX / 32);
-    const chunkZ = Math.floor(worldZ / 32);
-    const key = this.getChunkKey(chunkX, chunkZ);
-
-    const chunk = this.chunkData.get(key);
-    if (!chunk) {
-      console.warn(`Attempted to set block in non-existent or non-loaded chunk data at ${chunkX},${chunkZ}`);
-      return false;
-    }
-
-    const localX = ((worldX % 32) + 32) % 32;
-    const localZ = ((worldZ % 32) + 32) % 32;
-    const localY = worldY;
-
-    if (chunk.getVoxel(localX, localY, localZ) === blockId) {
-        return true; 
-    }
-
-    chunk.setVoxel(localX, localY, localZ, blockId);
-    if (import.meta.env.DEV) {
-      console.debug(`Set block at ${worldX},${worldY},${worldZ} (local ${localX},${localY},${localZ} in chunk ${key}) to ${blockId}`);
-    }
-
-    const oldChunkMeshDetails = this.loadedChunks.get(key);
-    const currentLodLevel = oldChunkMeshDetails ? oldChunkMeshDetails.lodLevel : LODLevel.HIGH;
-
-    // Do not remove the old mesh from the scene yet.
-
-    try {
-      // 1. Generate new mesh data (this is the async part)
-      const meshData = await this.mesherManager.meshChunk(chunk);
-
-      // --- From this point on, we have the new mesh data --- 
-
-      // 2. Now, remove old mesh from scene and dispose its geometry (if it existed)
-      if (oldChunkMeshDetails && oldChunkMeshDetails.mesh) {
-        if (oldChunkMeshDetails.mesh.parent) {
-          this.scene.remove(oldChunkMeshDetails.mesh);
-        }
-        oldChunkMeshDetails.mesh.geometry.dispose();
-      }
-
-      // Handle case where new mesh is empty (e.g., all blocks removed)
-      if (!meshData || meshData.positions.length === 0) {
-        console.warn(`Re-mesh for chunk ${key} resulted in empty mesh. Original block: ${worldX},${worldY},${worldZ}`);
-        // If mesh is empty, ensure it's removed from loadedChunks if it was there, and no new mesh is added.
-        if (this.loadedChunks.has(key)) {
-            this.loadedChunks.delete(key);
-        }
-        return true; // Voxel was set, even if mesh is now empty
-      }
-
-      // 3. Create new Three.js geometry and mesh
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute('position', new THREE.BufferAttribute(meshData.positions, 3));
-      geometry.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
-      geometry.setAttribute('uv', new THREE.BufferAttribute(meshData.uvs, 2));
-      geometry.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
-
-      const newChunkMesh = new THREE.Mesh(geometry, this.chunkMaterial);
-      newChunkMesh.position.set(chunkX * 32, 0, chunkZ * 32);
-      newChunkMesh.castShadow = true;
-      newChunkMesh.receiveShadow = true;
-
-      // 4. Add new mesh to scene
-      this.scene.add(newChunkMesh);
-
-      // 5. Update in loadedChunks map
-      this.loadedChunks.set(key, {
-        mesh: newChunkMesh,
-        lastAccessed: Date.now(),
-        lodLevel: currentLodLevel 
-      });
-
-      if (import.meta.env.DEV) {
-        console.debug(`Chunk ${key} re-meshed successfully after block change.`);
-      }
-      return true;
-    } catch (error) {
-      console.error(`Error re-meshing chunk ${key} after block change:`, error);
-      // If an error occurs during re-meshing, the old mesh might still be in the scene (if it wasn't removed yet) 
-      // or was removed just before this catch. This part is tricky.
-      // If we didn't remove the oldMesh yet, it's still there. If we did, it's gone.
-      // The current refined logic removes oldMesh *after* meshData is available but *before* this catch block if an error occurs in geometry creation.
-      // So, if an error happens here, the old mesh (if it existed) has already been removed and its geometry disposed.
-      // We should ensure that if the new mesh creation fails, the chunk entry is cleaned from loadedChunks.
-      if (this.loadedChunks.has(key)){
-          const entry = this.loadedChunks.get(key);
-          // If the entry still points to the old mesh details that we intended to replace, clean it.
-          if(entry === oldChunkMeshDetails){
-             this.loadedChunks.delete(key);
-          }
-      }
-      return false;
-    }
-  }
-
-  dispose(): void {
-    // Clean up all chunks
-    for (const [key, chunkData] of this.loadedChunks) {
-      if (chunkData.mesh.parent) {
-        chunkData.mesh.parent.remove(chunkData.mesh);
-      }
-      chunkData.mesh.geometry.dispose();
-      if (Array.isArray(chunkData.mesh.material)) {
-        chunkData.mesh.material.forEach(material => material.dispose());
-      } else {
-        chunkData.mesh.material.dispose();
-      }
-    }
-    this.loadedChunks.clear();
-    this.loadingChunks.clear();
-    this.lastLODLevels.clear();
-    this.chunkHeightmaps.clear();
-    this.chunkData.clear();
-    this.lastPlayerPosition = null;
-  }
-
-  public getLoadedChunkMeshes(): THREE.Mesh[] {
-    const meshes: THREE.Mesh[] = [];
-    for (const chunkMesh of this.loadedChunks.values()) {
-      meshes.push(chunkMesh.mesh);
-    }
-    return meshes;
-  }
-
   public getNearbyChunkMeshes(centerWorldPos: THREE.Vector3, worldRadius: number): THREE.Mesh[] {
     const nearbyMeshes: THREE.Mesh[] = [];
     const centerChunkX = Math.floor(centerWorldPos.x / 32);
@@ -687,5 +560,227 @@ export class ChunkManager {
       }
     }
     return nearbyMeshes;
+  }
+
+  private _decodeRLEBytes(rleBytes: number[]): { flatIndex: number, blockId: number }[] {
+    const changes: { flatIndex: number, blockId: number }[] = [];
+    if (!rleBytes || rleBytes.length === 0) {
+      return changes;
+    }
+
+    // Each entry is 6 bytes: 4 for index, 1 for count, 1 for blockId
+    for (let i = 0; i < rleBytes.length; ) {
+      if (i + 6 > rleBytes.length) { 
+        console.error('Malformed RLE data: insufficient bytes for a full entry. Remaining bytes:', rleBytes.slice(i));
+        break; 
+      }
+
+      const startIndex = rleBytes[i] |
+                       (rleBytes[i+1] << 8) |
+                       (rleBytes[i+2] << 16) |
+                       (rleBytes[i+3] << 24);
+      const count = rleBytes[i+4];
+      const blockId = rleBytes[i+5];
+
+      for (let k = 0; k < count; k++) {
+        changes.push({ flatIndex: startIndex + k, blockId });
+      }
+      i += 6; 
+    }
+    return changes;
+  }
+
+  public async applyRLEUpdate(chunkX: number, chunkZ: number, rleBytes: number[]): Promise<void> {
+    const key = this.getChunkKey(chunkX, chunkZ);
+    const chunk = this.chunkData.get(key);
+
+    if (!chunk) {
+      console.warn(`ChunkManager:applyRLEUpdate - Chunk data not found for ${key}, cannot apply RLE update.`);
+      return;
+    }
+    
+    if (chunk.lodLevel !== LODLevel.HIGH && chunk.lodLevel !== undefined) {
+        console.warn(`ChunkManager:applyRLEUpdate - Attempting to apply RLE update to a non-HIGH LOD chunk (${key}, LOD: ${chunk.lodLevel}).`);
+    }
+
+    const decodedChanges = this._decodeRLEBytes(rleBytes);
+    if (import.meta.env.DEV) {
+        console.debug(`ChunkManager:applyRLEUpdate - Decoded ${decodedChanges.length} changes for chunk ${key} from rleBytes:`, rleBytes, decodedChanges);
+    }
+
+    if (decodedChanges.length === 0 && rleBytes.length > 0) {
+        console.warn(`ChunkManager:applyRLEUpdate - RLE bytes were present but no changes decoded for chunk ${key}. RLE Data:`, rleBytes);
+    }
+
+    for (const change of decodedChanges) {
+      chunk.setVoxelByFlatIndex(change.flatIndex, change.blockId);
+    }
+
+    const oldChunkMeshDetails = this.loadedChunks.get(key);
+
+    if (oldChunkMeshDetails) {
+      if (import.meta.env.DEV) {
+        console.debug(`ChunkManager:applyRLEUpdate - Remeshing chunk ${key} after applying RLE update.`);
+      }
+
+      try {
+        const updatedChunkData = this.chunkData.get(key);
+        if (!updatedChunkData) {
+            console.error(`ChunkManager:applyRLEUpdate - Critical error: Chunk data for ${key} disappeared before remeshing.`);
+            return;
+        }
+        // Generate new mesh data first
+        const meshData = await this.mesherManager.meshChunk(updatedChunkData);
+
+        // Now that new mesh data is ready, create the new mesh
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(meshData.positions, 3));
+        geometry.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
+        geometry.setAttribute('uv', new THREE.BufferAttribute(meshData.uvs, 2));
+        geometry.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
+
+        const newMesh = new THREE.Mesh(geometry, this.chunkMaterial);
+        newMesh.position.set(chunkX * CHUNK_SIZE.WIDTH, 0, chunkZ * CHUNK_SIZE.DEPTH);
+        newMesh.castShadow = true;
+        newMesh.receiveShadow = true;
+
+        // Then, remove old mesh from scene and dispose its geometry
+        if (oldChunkMeshDetails.mesh.parent) {
+          this.scene.remove(oldChunkMeshDetails.mesh);
+        }
+        oldChunkMeshDetails.mesh.geometry.dispose();
+
+        // Add new mesh to scene
+        this.scene.add(newMesh);
+        
+        this.loadedChunks.set(key, {
+          ...oldChunkMeshDetails,
+          mesh: newMesh,
+          lastAccessed: Date.now()
+        });
+        if (import.meta.env.DEV) {
+            console.debug(`ChunkManager:applyRLEUpdate - Chunk ${key} successfully remeshed.`);
+        }
+      } catch (error) {
+        console.error(`ChunkManager:applyRLEUpdate - Error remeshing chunk ${key} after RLE update:`, error);
+      }
+    } else {
+      console.warn(`ChunkManager:applyRLEUpdate - Chunk mesh details not found for ${key}, cannot remesh immediately. Data updated, should remesh on next cycle if visible.`);
+    }
+  }
+
+  public async setBlock(worldX: number, worldY: number, worldZ: number, blockId: number): Promise<boolean> {
+    const chunkX = Math.floor(worldX / 32);
+    const chunkZ = Math.floor(worldZ / 32);
+    const key = this.getChunkKey(chunkX, chunkZ);
+
+    const chunk = this.chunkData.get(key);
+    if (!chunk) {
+      console.warn(`Attempted to set block in non-existent or non-loaded chunk data at ${chunkX},${chunkZ}`);
+      return false;
+    }
+
+    const localX = ((worldX % 32) + 32) % 32;
+    const localZ = ((worldZ % 32) + 32) % 32;
+    const localY = worldY;
+
+    if (chunk.getVoxel(localX, localY, localZ) === blockId) {
+        return true; 
+    }
+
+    chunk.setVoxel(localX, localY, localZ, blockId);
+    if (import.meta.env.DEV) {
+      console.debug(`Set block at ${worldX},${worldY},${worldZ} (local ${localX},${localY},${localZ} in chunk ${key}) to ${blockId}`);
+    }
+
+    const oldChunkMeshDetails = this.loadedChunks.get(key);
+
+    try {
+      // Generate new mesh data first
+      const meshData = await this.mesherManager.meshChunk(chunk);
+
+      // Handle case where new mesh is empty (e.g., all blocks removed)
+      if (!meshData || meshData.positions.length === 0) {
+        if (import.meta.env.DEV) {
+            console.warn(`Re-mesh for chunk ${key} resulted in empty mesh. Original block: ${worldX},${worldY},${worldZ}`);
+        }
+        // If mesh is empty, remove old mesh and its entry from loadedChunks
+        if (oldChunkMeshDetails && oldChunkMeshDetails.mesh) {
+          if (oldChunkMeshDetails.mesh.parent) {
+            this.scene.remove(oldChunkMeshDetails.mesh);
+          }
+          oldChunkMeshDetails.mesh.geometry.dispose();
+          this.loadedChunks.delete(key); 
+        }
+        return true; 
+      }
+
+      // Now that new mesh data is ready, create the new Three.js geometry and mesh
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(meshData.positions, 3));
+      geometry.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
+      geometry.setAttribute('uv', new THREE.BufferAttribute(meshData.uvs, 2));
+      geometry.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
+
+      const newMesh = new THREE.Mesh(geometry, this.chunkMaterial);
+      newMesh.position.set(chunkX * CHUNK_SIZE.WIDTH, 0, chunkZ * CHUNK_SIZE.DEPTH);
+      newMesh.castShadow = true;
+      newMesh.receiveShadow = true;
+
+      // Then, remove old mesh from scene and dispose its geometry (if it existed)
+      if (oldChunkMeshDetails && oldChunkMeshDetails.mesh) {
+        if (oldChunkMeshDetails.mesh.parent) {
+          this.scene.remove(oldChunkMeshDetails.mesh);
+        }
+        oldChunkMeshDetails.mesh.geometry.dispose();
+      }
+
+      // Add new mesh to scene
+      this.scene.add(newMesh);
+
+      // Update in loadedChunks map
+      this.loadedChunks.set(key, {
+        mesh: newMesh,
+        lastAccessed: Date.now(),
+        lodLevel: oldChunkMeshDetails ? oldChunkMeshDetails.lodLevel : LODLevel.HIGH 
+      });
+
+      if (import.meta.env.DEV) {
+        console.debug(`Chunk ${key} re-meshed successfully after block change.`);
+      }
+      return true;
+    } catch (error) {
+      console.error(`Error re-meshing chunk ${key} after block change:`, error);
+      return false;
+    }
+  }
+
+  dispose(): void {
+    // Clean up all chunks
+    for (const [key, chunkData] of this.loadedChunks) {
+      if (chunkData.mesh.parent) {
+        chunkData.mesh.parent.remove(chunkData.mesh);
+      }
+      chunkData.mesh.geometry.dispose();
+      if (Array.isArray(chunkData.mesh.material)) {
+        chunkData.mesh.material.forEach(material => material.dispose());
+      } else {
+        chunkData.mesh.material.dispose();
+      }
+    }
+    this.loadedChunks.clear();
+    this.loadingChunks.clear();
+    this.lastLODLevels.clear();
+    this.chunkHeightmaps.clear();
+    this.chunkData.clear();
+    this.lastPlayerPosition = null;
+  }
+
+  public getLoadedChunkMeshes(): THREE.Mesh[] {
+    const meshes: THREE.Mesh[] = [];
+    for (const chunkMesh of this.loadedChunks.values()) {
+      meshes.push(chunkMesh.mesh);
+    }
+    return meshes;
   }
 } 

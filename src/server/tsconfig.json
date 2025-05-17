@@ -5,7 +5,7 @@
     "moduleResolution": "Node",
     "target": "ESNext",
     "outDir": "../../dist/server",
-    "rootDir": ".",
+    "rootDir": "../",
     "allowSyntheticDefaultImports": true
   },
   "include": ["./**/*"]

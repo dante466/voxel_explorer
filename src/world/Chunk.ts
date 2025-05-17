@@ -1,6 +1,6 @@
 export const CHUNK_SIZE = {
   WIDTH: 32,
-  HEIGHT: 32,
+  HEIGHT: 128,
   DEPTH: 32
 };
 
@@ -78,6 +78,18 @@ export class Chunk {
   private getIndex(x: number, y: number, z: number): number {
     const size = this.getSizeConstants();
     return y * size.WIDTH * size.DEPTH + z * size.WIDTH + x;
+  }
+
+  // Set voxel at a flat 1D array index
+  setVoxelByFlatIndex(index: number, value: number): void {
+    const size = this.getSizeConstants();
+    const currentVolume = size.WIDTH * size.HEIGHT * size.DEPTH;
+    if (index >= 0 && index < currentVolume) {
+      this.data[index] = value;
+      this.compressedData = null; // Invalidate compression cache
+    } else {
+      console.warn(`Attempted to set voxel by flat index ${index} which is out of bounds for current LOD volume ${currentVolume}.`);
+    }
   }
 
   // Compress chunk data using RLE

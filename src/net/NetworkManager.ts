@@ -144,9 +144,27 @@ export class NetworkManager {
 
         } else if (data.type === 'blockUpdate') {
           // Server confirmed a block change (e.g., after mining)
-          console.log('Received blockUpdate from server:', data);
-          if (data.position && typeof data.newBlockId !== 'undefined') {
-            this.chunkManager.setBlock(data.position.x, data.position.y, data.position.z, data.newBlockId);
+          console.log('Received blockUpdate (RLE) from server:', data);
+          if (typeof data.chunkX === 'number' && typeof data.chunkZ === 'number' && Array.isArray(data.rleBytes)) {
+            // Ensure rleBytes contains numbers, as it comes from JSON
+            const numericRleBytes: number[] = data.rleBytes.filter((b: any) => typeof b === 'number');
+            if (numericRleBytes.length !== data.rleBytes.length) {
+                console.warn('NetworkManager: Received rleBytes with non-numeric values.', data.rleBytes);
+            }            
+            if (numericRleBytes.length > 0) {
+                this.chunkManager.applyRLEUpdate(data.chunkX, data.chunkZ, numericRleBytes)
+                    .catch(error => {
+                        console.error('Error applying RLE update to chunkManager:', error);
+                    });
+            } else if (data.rleBytes.length > 0) {
+                // This case means rleBytes was an array but all elements were non-numeric or it was filtered to empty
+                console.warn('NetworkManager: rleBytes received but resulted in empty numeric array after filtering.', data.rleBytes);
+            } else {
+                // rleBytes was genuinely empty array, could be valid if server can send empty diffs.
+                console.log('NetworkManager: Received empty rleBytes array for blockUpdate. No changes to apply.');
+            }
+          } else {
+            console.warn('NetworkManager: Received malformed blockUpdate message (RLE expected):', data);
           }
         } else if (data.type === 'mineError') {
           // Server sent a mining error

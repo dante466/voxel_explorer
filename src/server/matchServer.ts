@@ -3,6 +3,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createPhysicsWorld, initRapier } from './physics.js';
 import type { MatchState, Player, Chunk } from './types.js';
 import { ClientCommandType } from './types.js';
+import { encodeChunkDiff, type VoxelChange } from '../world/encodeChunkDiff.js';
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -232,12 +233,24 @@ async function startServer() {
         console.log(`server setBlock success: ${success}`);
 
         if (success) {
+          const chunkX = Math.floor(targetVoxelX / CHUNK_SIZE_X);
+          const chunkZ = Math.floor(targetVoxelZ / CHUNK_SIZE_Z);
+          const localX = ((targetVoxelX % CHUNK_SIZE_X) + CHUNK_SIZE_X) % CHUNK_SIZE_X;
+          const localY = targetVoxelY;
+          const localZ = ((targetVoxelZ % CHUNK_SIZE_Z) + CHUNK_SIZE_Z) % CHUNK_SIZE_Z;
+
+          const voxelFlatIndex = localY * (CHUNK_SIZE_X * CHUNK_SIZE_Z) + localZ * CHUNK_SIZE_X + localX;
+          
+          const changes: VoxelChange[] = [{ voxelFlatIndex, newBlockId: 0 }]; // 0 for mined block (air)
+          const rleBytes = encodeChunkDiff(changes);
+
           const blockUpdateMessage = {
             type: 'blockUpdate',
-            position: { x: targetVoxelX, y: targetVoxelY, z: targetVoxelZ },
-            newBlockId: 0
+            chunkX: chunkX,
+            chunkZ: chunkZ,
+            rleBytes: Array.from(rleBytes) // Convert Uint8Array to array for JSON
           };
-          console.log('[Server] Broadcasting blockUpdateMessage:', blockUpdateMessage);
+          console.log('[Server] Broadcasting blockUpdateMessage (RLE):', blockUpdateMessage);
           wssInstance.clients.forEach((client: WebSocket) => {
             if (client.readyState === WebSocket.OPEN) {
               client.send(JSON.stringify(blockUpdateMessage));
@@ -245,58 +258,70 @@ async function startServer() {
           });
         } else {
           // This case might occur if setBlock itself has internal validation that fails
-          sendError(ws, 'mineError', seq, 'SetBlockFailed', 'Server failed to set block.');
+          // or if the block was already air (though setBlock might return true for that)
+          sendError(ws, 'mineError', seq, 'SetBlockFailed', 'Server failed to set block or no change.');
         }
         break;
       }
       case ClientCommandType.PLACE_BLOCK: {
-        console.log(`PLACE_BLOCK case entered for player ${cmdPlayerId}. Message:`, message);
         const { targetVoxelX, targetVoxelY, targetVoxelZ, blockId, seq } = message;
+        const blockIdToPlace = blockId; // blockId from message
 
-        if (typeof targetVoxelX !== 'number' || typeof targetVoxelY !== 'number' || typeof targetVoxelZ !== 'number' || typeof blockId !== 'number') {
-          console.error('Invalid PLACE_BLOCK command: missing coordinates or blockId.');
-          sendError(ws, 'placeError', seq, 'InvalidPayload', 'Missing target coordinates or blockId.');
-          break;
-        }
-
-        if (blockId <= 0) { // Assuming 0 is air and non-positive IDs are invalid for placement
-            console.warn(`PLACE_BLOCK for ${cmdPlayerId} denied: invalid blockId ${blockId}.`);
-            sendError(ws, 'placeError', seq, 'InvalidBlockId', 'Cannot place air or invalid block ID.');
+        if (typeof targetVoxelX !== 'number' || typeof targetVoxelY !== 'number' || typeof targetVoxelZ !== 'number' || typeof blockIdToPlace !== 'number') {
+            sendError(ws, 'placeError', seq, 'InvalidParameters', 'Missing or invalid parameters for PLACE_BLOCK.');
             break;
         }
-
-        console.log(`Processing PLACE_BLOCK for ${targetVoxelX},${targetVoxelY},${targetVoxelZ} with blockId ${blockId}`);
-        console.log('Validating PLACE_BLOCK...');
-
+        
+        // Basic AABB validation
         if (targetVoxelX < WORLD_MIN_X || targetVoxelX > WORLD_MAX_X ||
             targetVoxelY < WORLD_MIN_Y || targetVoxelY > WORLD_MAX_Y ||
             targetVoxelZ < WORLD_MIN_Z || targetVoxelZ > WORLD_MAX_Z) {
-          console.warn(`PLACE_BLOCK for ${cmdPlayerId} denied: out of bounds (${targetVoxelX},${targetVoxelY},${targetVoxelZ}).`);
-          sendError(ws, 'placeError', seq, 'OutOfBounds', 'Target voxel is out of world bounds.');
-          break;
+            sendError(ws, 'placeError', seq, 'OutOfBounds', 'Target voxel is out of world bounds.');
+            break;
         }
-        console.log('PLACE_BLOCK validation passed.');
 
-        // TODO: Add more validation (e.g., not placing inside player, target block is air)
+        // Validate blockIdToPlace (e.g., not air, within valid range)
+        if (blockIdToPlace <= 0) { // Assuming 0 is air and non-placeable
+            sendError(ws, 'placeError', seq, 'InvalidBlockID', 'Cannot place air or invalid block ID.');
+            break;
+        }
+        
+        // TODO: Add more validation (distance to player, ensure target is air/replaceable)
+        // For now, let's assume we can only place in air blocks (getBlock should return 0 or null)
+        const currentBlock = getBlock(matchState, targetVoxelX, targetVoxelY, targetVoxelZ);
+        if (currentBlock !== 0 && currentBlock !== null) { // Check if block is not air
+            sendError(ws, 'placeError', seq, 'BlockOccupied', `Cannot place block at (${targetVoxelX},${targetVoxelY},${targetVoxelZ}), it's occupied by ${currentBlock}.`);
+            break;
+        }
 
-        console.log(`Calling server setBlock(${targetVoxelX},${targetVoxelY},${targetVoxelZ}, ${blockId})`);
-        const success = setBlock(matchState, targetVoxelX, targetVoxelY, targetVoxelZ, blockId);
-        console.log(`server setBlock success: ${success}`);
+        const success = setBlock(matchState, targetVoxelX, targetVoxelY, targetVoxelZ, blockIdToPlace);
 
         if (success) {
-          const blockUpdateMessage = {
-            type: 'blockUpdate',
-            position: { x: targetVoxelX, y: targetVoxelY, z: targetVoxelZ },
-            newBlockId: blockId
-          };
-          console.log('[Server] Broadcasting blockUpdateMessage:', blockUpdateMessage);
-          wssInstance.clients.forEach((client: WebSocket) => {
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify(blockUpdateMessage));
-            }
-          });
+            const chunkX = Math.floor(targetVoxelX / CHUNK_SIZE_X);
+            const chunkZ = Math.floor(targetVoxelZ / CHUNK_SIZE_Z);
+            const localX = ((targetVoxelX % CHUNK_SIZE_X) + CHUNK_SIZE_X) % CHUNK_SIZE_X;
+            const localY = targetVoxelY;
+            const localZ = ((targetVoxelZ % CHUNK_SIZE_Z) + CHUNK_SIZE_Z) % CHUNK_SIZE_Z;
+
+            const voxelFlatIndex = localY * (CHUNK_SIZE_X * CHUNK_SIZE_Z) + localZ * CHUNK_SIZE_X + localX;
+            
+            const changes: VoxelChange[] = [{ voxelFlatIndex, newBlockId: blockIdToPlace }];
+            const rleBytes = encodeChunkDiff(changes);
+
+            const blockUpdateMessage = {
+                type: 'blockUpdate',
+                chunkX: chunkX,
+                chunkZ: chunkZ,
+                rleBytes: Array.from(rleBytes) // Convert Uint8Array to array for JSON
+            };
+            console.log('[Server] Broadcasting blockUpdateMessage (RLE):', blockUpdateMessage);
+            wssInstance.clients.forEach((client: WebSocket) => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify(blockUpdateMessage));
+                }
+            });
         } else {
-          sendError(ws, 'placeError', seq, 'SetBlockFailed', 'Server failed to set block.');
+            sendError(ws, 'placeError', seq, 'SetBlockFailed', 'Server failed to place block.');
         }
         break;
       }
