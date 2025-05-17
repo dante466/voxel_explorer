@@ -26,9 +26,19 @@ import { Object3DRef } from './ecs/systems/transformSystem';
 import { getMouseNDC, getPickingRay, raycastVoxel, getCenterScreenRay } from './utils/raycastVoxel';
 import { VoxelHighlighter } from './render/Highlight';
 
+// Initialize debugMode early for other systems
+const urlParams = new URLSearchParams(window.location.search);
+const debugMode = urlParams.has('debug');
+
 // Player Model Constants
 const PLAYER_HEIGHT = 1.8; // meters
 const PLAYER_RADIUS = 0.4; // meters
+
+// Constants for M4.2 & M4.3
+const DEFAULT_PLACE_BLOCK_ID = 1; // Example: 1 for a generic solid block
+let lastBlockActionTime = 0;
+const BLOCK_ACTION_COOLDOWN = 250; // milliseconds
+let isOnBlockActionCooldown = false;
 
 // Initialize scene
 const scene = new THREE.Scene();
@@ -45,8 +55,8 @@ const initialAspect = window.innerWidth / window.innerHeight;
 // Temp: For now, just adjust the call, assuming playerModelMesh is defined before this line
 // This ordering will be fixed by moving playerModelMesh creation up.
 
-// Initialize Input Look System
-const inputLookSystemInstance: BitecsSystem = createInputLookSystem(world, document);
+// Initialize Input Look System (pass debugMode)
+const inputLookSystemInstance: BitecsSystem = createInputLookSystem(world, document, debugMode);
 
 // Initialize Transform System
 const transformSystem = createTransformSystem(world);
@@ -111,6 +121,7 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.domElement.setAttribute('tabindex', '-1');
 document.body.appendChild(renderer.domElement);
 
 // OLD POINTER LOCK CONTROLS - REMOVED
@@ -550,20 +561,42 @@ if (typeof mainKeyUpHandler !== 'undefined') document.addEventListener('keyup', 
 // camera.getWorldDirection(lastCameraDirection); // OLD
 // lastCameraPosition.copy(camera.position); // OLD
 
-// Click to start pointer lock (not PointerLockControls)
+// Click on canvas to request pointer lock
 renderer.domElement.addEventListener('click', () => {
-  // controls.lock(); // OLD
-  if (!document.pointerLockElement) {
+  console.log('renderer.domElement click listener fired. Current pointerLockElement:', document.pointerLockElement, 'isPointerLockedToCanvas flag:', isPointerLockedToCanvas);
+  if (!isPointerLockedToCanvas && !document.pointerLockElement) { // Check our flag too
+    console.log('Attempting to requestPointerLock as flag is false and no element is locked...');
     renderer.domElement.requestPointerLock();
+  } else if (isPointerLockedToCanvas) {
+    console.log('renderer.domElement click: Ignored, isPointerLockedToCanvas is true.');
+  } else if (document.pointerLockElement) {
+    console.log('renderer.domElement click: Ignored, another element has pointer lock:', document.pointerLockElement);
   }
 });
 
-// Initialize stats if in debug mode
-const urlParams = new URLSearchParams(window.location.search);
-// ... existing code ...
-const debugMode = urlParams.has('debug');
-let stats: Stats | null = null;
+let isPointerLockedToCanvas = false; // Flag to track pointer lock state on our canvas
 
+const onPointerLockChange = () => { // NAMED FUNCTION
+  console.log('onPointerLockChange fired. document.pointerLockElement is:', document.pointerLockElement, 'renderer.domElement is:', renderer.domElement); 
+  if (document.pointerLockElement === renderer.domElement || document.pointerLockElement === document.body) { // Accept body as a valid lock target
+    console.log('Pointer considered locked for gameplay (target: ' + document.pointerLockElement?.nodeName + ').');
+    isPointerLockedToCanvas = true;
+  } else {
+    console.log('Pointer unlocked from canvas (or locked to a different element).'); 
+    isPointerLockedToCanvas = false;
+  }
+};
+
+const onPointerLockError = () => { // NAMED FUNCTION
+  console.error('Pointer lock error.');
+  isPointerLockedToCanvas = false; // Ensure flag is false on error
+};
+
+document.addEventListener('pointerlockchange', onPointerLockChange, false);
+document.addEventListener('pointerlockerror', onPointerLockError, false);
+
+// Initialize stats if in debug mode
+let stats: Stats | null = null;
 if (debugMode) {
   stats = new Stats();
   stats.showPanel(0);
@@ -593,26 +626,76 @@ const MAX_RAYCAST_DISTANCE = 100; // Max distance for voxel picking
 
 // M4.1 - Function to update center-screen voxel highlight (called in animate loop)
 function updateCenterScreenVoxelHighlight() {
-  if (!gameCamera || !chunkManager || !voxelHighlighter) return; // Guard against uninitialized objects
+  if (!gameCamera || !chunkManager || !voxelHighlighter) return;
 
   if (!showBlockHighlighter) { 
-    voxelHighlighter.update(null); // Ensure 3D highlight is off if state var is false
+    voxelHighlighter.update(null);
     return;
   }
   
-  // If showBlockHighlighter is true, proceed with raycasting and updating.
   const pickRay = getCenterScreenRay(gameCamera);
   const result = raycastVoxel(pickRay.origin, pickRay.direction, chunkManager, MAX_RAYCAST_DISTANCE);
   
   if (result) {
     voxelHighlighter.update(result.position);
-    if (debugMode) { 
-        console.log('Center Target Voxel Coords:', result.voxel, 'Normal:', result.normal, 'Distance:', result.distance);
-    }
   } else {
     voxelHighlighter.update(null);
   }
 }
+
+// Event listener for mouse clicks to place/break blocks (M4.2 & M4.3)
+function handleBlockInteraction(event: MouseEvent) {
+  console.log(
+    'handleBlockInteraction called (document mousedown):', event.button, 
+    'isPointerLockedToCanvas flag?:', isPointerLockedToCanvas
+  );
+  if (!isPointerLockedToCanvas) { // Check our flag, not document.pointerLockElement directly here
+    // console.log('handleBlockInteraction: Pointer not locked to game canvas (based on flag), returning early.');
+    return; 
+  }
+
+  const now = Date.now();
+  // Cooldown logic primarily for non-flying mode, server will also validate
+  if (isOnBlockActionCooldown && !movementSystemControls.isFlying()) {
+    // Update crosshair to grey during cooldown
+    if (showCrosshair) crosshairElement.style.backgroundColor = 'grey';
+    return;
+  }
+
+  // Use center screen ray for block interaction
+  const centerRay = getCenterScreenRay(gameCamera);
+  const hit = raycastVoxel(
+    centerRay.origin, 
+    centerRay.direction, 
+    chunkManager,
+    10 // Max distance
+  );
+
+  if (hit && hit.voxel && hit.normal) {
+    if (event.button === 0) { // Left click - Mine block
+      console.log(`Attempting to send mine command for block at: ${hit.voxel.x}, ${hit.voxel.y}, ${hit.voxel.z}`);
+      networkManager.sendMineCommand(hit.voxel.x, hit.voxel.y, hit.voxel.z);
+    } else if (event.button === 2) { // Right click - Place block
+      const placePosition = new THREE.Vector3(
+        hit.voxel.x + hit.normal.x,
+        hit.voxel.y + hit.normal.y,
+        hit.voxel.z + hit.normal.z
+      );
+      console.log(`Attempting to send place command for block at: ${placePosition.x}, ${placePosition.y}, ${placePosition.z} with block ID ${DEFAULT_PLACE_BLOCK_ID}`);
+      networkManager.sendPlaceCommand(placePosition.x, placePosition.y, placePosition.z, DEFAULT_PLACE_BLOCK_ID);
+    }
+  } else {
+    // console.log('No block hit or invalid hit normal.');
+  }
+}
+
+// ADD new mousedown listener on document for block interaction when pointer is locked to the canvas
+const documentMousedownHandler = (event: MouseEvent) => {
+  // This handler is always active, handleBlockInteraction will check the lock state flag
+  handleBlockInteraction(event);
+};
+
+document.addEventListener('mousedown', documentMousedownHandler);
 
 // Animation loop
 const clock = new THREE.Clock();
@@ -633,8 +716,15 @@ function animate() {
   const playerWorldZ = Transform.position.z[playerEntity];
   chunkManager.update(playerWorldX, playerWorldZ, scene, true);
 
-  // M4.1 - Update center screen voxel highlight each frame
   updateCenterScreenVoxelHighlight();
+
+  // Update crosshair color based on cooldown state (only relevant if cooldown was applied)
+  if (isOnBlockActionCooldown && (Date.now() - lastBlockActionTime >= BLOCK_ACTION_COOLDOWN)) {
+    isOnBlockActionCooldown = false;
+    if (crosshairElement) {
+      crosshairElement.style.backgroundColor = 'red'; // Normal color
+    }
+  }
 
   // Update collision visualization (if shown)
   if (showCollisionBoxes) {
@@ -656,27 +746,27 @@ window.addEventListener('unload', () => {
   chunkManager.dispose();
   noiseManager.dispose();
   mesherManager.dispose();
-  document.removeEventListener('keydown', mainKeyDownHandler); // Cleanup mainKeyDownHandler
-  document.removeEventListener('keyup', mainKeyUpHandler);   // Cleanup mainKeyUpHandler
+  document.removeEventListener('keydown', mainKeyDownHandler);
+  document.removeEventListener('keyup', mainKeyUpHandler);
   if (adminMenu.parentNode) document.body.removeChild(adminMenu);
 
-  // New system cleanup
   cameraSystemManager.cleanup();
   if ((inputLookSystemInstance as any).cleanup) {
     (inputLookSystemInstance as any).cleanup();
   }
-  movementSystemControls.cleanup(); // Cleanup PlayerMovementSystem listeners
+  movementSystemControls.cleanup();
 
-  // Cleanup collision visualizer cache
   collisionMeshCache.forEach(mesh => {
     if (mesh.geometry) mesh.geometry.dispose();
-    // Material is shared, so don't dispose it here unless it's the last user
     if (mesh.parent) mesh.parent.remove(mesh);
   });
   collisionMeshCache.clear();
 
-  // In cleanupGame or window unload, ensure crosshair is removed if needed
   if (crosshairElement && crosshairElement.parentNode) {
     crosshairElement.parentNode.removeChild(crosshairElement);
   }
+
+  document.removeEventListener('mousedown', documentMousedownHandler);
+  document.removeEventListener('pointerlockchange', onPointerLockChange, false);
+  document.removeEventListener('pointerlockerror', onPointerLockError, false);
 }); 

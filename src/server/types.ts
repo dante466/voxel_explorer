@@ -1,5 +1,12 @@
 import { WebSocket } from 'ws';
 
+// Duplicated from client src/net/types.ts to avoid pathing issues with server's rootDir
+export enum ClientCommandType {
+  PLAYER_INPUT = 'playerInput',
+  MINE_BLOCK = 'mineBlock',
+  PLACE_BLOCK = 'placeBlock',
+}
+
 export interface Player {
   id: string;
   position: { x: number; y: number; z: number };

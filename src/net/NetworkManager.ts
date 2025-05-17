@@ -1,6 +1,7 @@
 import { InputHandler } from './InputHandler';
 import { WebSocketClient } from './WebSocketClient';
 import type { ClientCommand } from './types';
+import { ClientCommandType } from './types';
 import type { IWorld } from 'bitecs'; // Import IWorld
 import { Transform } from '../ecs/world'; // Import Transform component
 import { CameraTarget } from '../ecs/components/CameraTarget'; // For cameraYaw
@@ -37,7 +38,7 @@ export class NetworkManager {
 
   // Temporary vectors for calculations to avoid allocations in loop
   private tempCurrentPosition = new THREE.Vector3();
-  private tempServerPosition = new THREE.Vector3();
+  // private tempServerPosition = new THREE.Vector3(); // No longer used here
 
   constructor(
     serverUrl: string, 
@@ -60,7 +61,7 @@ export class NetworkManager {
     this.wsClient.onMessage = (message: string) => {
       try {
         const data = JSON.parse(message);
-        // Assuming server sends: { type: 'stateUpdate', state: { id, position: {x,y,z}, rotation: {x,y,z,w}, lastProcessedInputSeq } }
+        
         if (data.type === 'stateUpdate' && data.state && data.state.id === this.playerEntityId) {
           const serverState = data.state;
           // console.log('Received server state:', serverState);
@@ -141,7 +142,20 @@ export class NetworkManager {
             yVelocityForReplay = outputState.newYVelocity; // Thread the yVelocity
           }
 
-        } else if (data.type === 'stateUpdate') {
+        } else if (data.type === 'blockUpdate') {
+          // Server confirmed a block change (e.g., after mining)
+          console.log('Received blockUpdate from server:', data);
+          if (data.position && typeof data.newBlockId !== 'undefined') {
+            this.chunkManager.setBlock(data.position.x, data.position.y, data.position.z, data.newBlockId);
+          }
+        } else if (data.type === 'mineError') {
+          // Server sent a mining error
+          console.error(`Mine Error (seq: ${data.seq}, code: ${data.code}): ${data.reason}`);
+          // Potentially alert the user or revert optimistic updates if we add them later
+        } else if (data.type === 'placeError') {
+          console.error(`Place Error (seq: ${data.seq}, code: ${data.code}): ${data.reason}`);
+          // Potentially alert the user or revert optimistic updates
+        } else if (data.type === 'stateUpdate') { // For other entities, if ever needed
           // Handle other entities if needed
         }
       } catch (error) {
@@ -160,35 +174,86 @@ export class NetworkManager {
     this.wsClient.disconnect();
   }
 
+  // New method to send a mine command
+  public sendMineCommand(voxelX: number, voxelY: number, voxelZ: number): void {
+    this.clientInputSequenceNumber++;
+    const command: ClientCommand = {
+      commandType: ClientCommandType.MINE_BLOCK,
+      seq: this.clientInputSequenceNumber,
+      timestamp: Date.now(),
+      targetVoxelX: voxelX,
+      targetVoxelY: voxelY,
+      targetVoxelZ: voxelZ,
+    };
+    this.wsClient.sendCommand(command);
+    console.log('Sent MineBlockCommand:', command); 
+  }
+
+  public sendPlaceCommand(voxelX: number, voxelY: number, voxelZ: number, blockId: number): void {
+    this.clientInputSequenceNumber++;
+    const command: ClientCommand = {
+      commandType: ClientCommandType.PLACE_BLOCK,
+      seq: this.clientInputSequenceNumber,
+      timestamp: Date.now(),
+      targetVoxelX: voxelX,
+      targetVoxelY: voxelY,
+      targetVoxelZ: voxelZ,
+      blockId: blockId,
+    };
+    this.wsClient.sendCommand(command);
+    console.log('Sent PlaceBlockCommand:', command);
+  }
+
   private startCommandLoop(): void {
     if (this.commandInterval) return;
 
     this.commandInterval = window.setInterval(() => {
-      const command = this.inputHandler.getCommand();
+      const inputHandlerCommand = this.inputHandler.getCommand();
       this.clientInputSequenceNumber++;
-      const deltaTime = 1 / this.COMMAND_RATE;
+      const deltaTime = 1 / this.COMMAND_RATE; // Still needed for pending inputs if we decide to keep them separate
 
-      // Capture necessary state for replay
       const currentKeys = this.movementSystemControls.getKeyStates();
       const currentCameraYaw = CameraTarget.yaw[this.playerEntityId];
       const flyingStatus = this.movementSystemControls.isFlying();
 
-      this.pendingInputs.push({
+      const playerInputCommand: ClientCommand = {
+        commandType: ClientCommandType.PLAYER_INPUT,
         seq: this.clientInputSequenceNumber,
-        keys: currentKeys,
-        cameraYaw: currentCameraYaw,
-        currentIsFlying: flyingStatus,
-        deltaTime: deltaTime,
-        rawCommand: command, // Store the raw command for sending
-      });
+        timestamp: inputHandlerCommand.timestamp,
+        moveForward: !!currentKeys['KeyW'] || !!currentKeys['ArrowUp'],
+        moveBackward: !!currentKeys['KeyS'] || !!currentKeys['ArrowDown'],
+        moveLeft: !!currentKeys['KeyA'] || !!currentKeys['ArrowLeft'],
+        moveRight: !!currentKeys['KeyD'] || !!currentKeys['ArrowRight'],
+        jump: !!currentKeys['Space'],
+        descend: !!currentKeys['ShiftLeft'] || !!currentKeys['ControlLeft'],
+        mouseDeltaX: inputHandlerCommand.mouseDeltaX || 0,
+        mouseDeltaY: inputHandlerCommand.mouseDeltaY || 0,
+      };
 
-      // Send command with sequence number and type to server
-      this.wsClient.sendCommand({ 
-        type: "clientCommand", // Added type for the server to recognize
-        ...command, 
-        seq: this.clientInputSequenceNumber 
-      }); 
-      this.inputHandler.resetMouseDelta();
+      // Check for active input before sending and adding to pending inputs
+      const hasKeyMovement = playerInputCommand.moveForward || playerInputCommand.moveBackward || 
+                             playerInputCommand.moveLeft || playerInputCommand.moveRight || 
+                             playerInputCommand.jump || playerInputCommand.descend;
+      const hasMouseMovement = playerInputCommand.mouseDeltaX !== 0 || playerInputCommand.mouseDeltaY !== 0;
+
+      if (hasKeyMovement || hasMouseMovement) {
+        this.pendingInputs.push({
+          seq: this.clientInputSequenceNumber,
+          keys: currentKeys, 
+          cameraYaw: currentCameraYaw,
+          currentIsFlying: flyingStatus,
+          deltaTime: deltaTime, // deltaTime is for replaying this input
+          rawCommand: playerInputCommand, 
+        });
+        this.wsClient.sendCommand(playerInputCommand);
+      } else {
+        // If no active input, we still need to reset mouse delta from inputHandler for the next frame.
+        // However, we don't send a command or add to pending inputs if player is truly idle.
+        // This is a simplification; a more robust system might send periodic idle updates
+        // or always send input and have server ignore no-ops.
+      }
+      this.inputHandler.resetMouseDelta(); // Always reset delta from input handler
+
     }, 1000 / this.COMMAND_RATE);
   }
 

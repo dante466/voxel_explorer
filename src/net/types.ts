@@ -1,15 +1,28 @@
+export enum ClientCommandType {
+  PLAYER_INPUT = 'playerInput',
+  MINE_BLOCK = 'mineBlock',
+  PLACE_BLOCK = 'placeBlock', // Added for consistency, was in commandType literal
+}
+
 export interface ClientCommand {
-  moveForward: boolean;
-  moveBackward: boolean;
-  moveLeft: boolean;
-  moveRight: boolean;
-  moveUp: boolean;
-  moveDown: boolean;
-  mouseX: number;
-  mouseY: number;
-  timestamp: number;
   seq?: number;
-  type?: string;
+  timestamp?: number;
+  // For player input
+  type?: string; // TODO: gradually remove, replaced by commandType
+  commandType?: ClientCommandType;
+  moveForward?: boolean;
+  moveBackward?: boolean;
+  moveLeft?: boolean;
+  moveRight?: boolean;
+  jump?: boolean;
+  descend?: boolean; // For flying down or crouching
+  mouseDeltaX?: number;
+  mouseDeltaY?: number;
+  // For block interaction commands
+  targetVoxelX?: number;
+  targetVoxelY?: number;
+  targetVoxelZ?: number;
+  blockId?: number; // For placeBlock command
 }
 
 export interface ConnectionState {

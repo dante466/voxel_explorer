@@ -519,6 +519,105 @@ export class ChunkManager {
     return this.chunkData.get(chunkKey);
   }
 
+  // M4.2: New method to set a block and update the chunk mesh
+  public async setBlock(worldX: number, worldY: number, worldZ: number, blockId: number): Promise<boolean> {
+    const chunkX = Math.floor(worldX / 32);
+    const chunkZ = Math.floor(worldZ / 32);
+    const key = this.getChunkKey(chunkX, chunkZ);
+
+    const chunk = this.chunkData.get(key);
+    if (!chunk) {
+      console.warn(`Attempted to set block in non-existent or non-loaded chunk data at ${chunkX},${chunkZ}`);
+      return false;
+    }
+
+    const localX = ((worldX % 32) + 32) % 32;
+    const localZ = ((worldZ % 32) + 32) % 32;
+    const localY = worldY;
+
+    if (chunk.getVoxel(localX, localY, localZ) === blockId) {
+        return true; 
+    }
+
+    chunk.setVoxel(localX, localY, localZ, blockId);
+    if (import.meta.env.DEV) {
+      console.debug(`Set block at ${worldX},${worldY},${worldZ} (local ${localX},${localY},${localZ} in chunk ${key}) to ${blockId}`);
+    }
+
+    const oldChunkMeshDetails = this.loadedChunks.get(key);
+    const currentLodLevel = oldChunkMeshDetails ? oldChunkMeshDetails.lodLevel : LODLevel.HIGH;
+
+    // Do not remove the old mesh from the scene yet.
+
+    try {
+      // 1. Generate new mesh data (this is the async part)
+      const meshData = await this.mesherManager.meshChunk(chunk);
+
+      // --- From this point on, we have the new mesh data --- 
+
+      // 2. Now, remove old mesh from scene and dispose its geometry (if it existed)
+      if (oldChunkMeshDetails && oldChunkMeshDetails.mesh) {
+        if (oldChunkMeshDetails.mesh.parent) {
+          this.scene.remove(oldChunkMeshDetails.mesh);
+        }
+        oldChunkMeshDetails.mesh.geometry.dispose();
+      }
+
+      // Handle case where new mesh is empty (e.g., all blocks removed)
+      if (!meshData || meshData.positions.length === 0) {
+        console.warn(`Re-mesh for chunk ${key} resulted in empty mesh. Original block: ${worldX},${worldY},${worldZ}`);
+        // If mesh is empty, ensure it's removed from loadedChunks if it was there, and no new mesh is added.
+        if (this.loadedChunks.has(key)) {
+            this.loadedChunks.delete(key);
+        }
+        return true; // Voxel was set, even if mesh is now empty
+      }
+
+      // 3. Create new Three.js geometry and mesh
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(meshData.positions, 3));
+      geometry.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
+      geometry.setAttribute('uv', new THREE.BufferAttribute(meshData.uvs, 2));
+      geometry.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
+
+      const newChunkMesh = new THREE.Mesh(geometry, this.chunkMaterial);
+      newChunkMesh.position.set(chunkX * 32, 0, chunkZ * 32);
+      newChunkMesh.castShadow = true;
+      newChunkMesh.receiveShadow = true;
+
+      // 4. Add new mesh to scene
+      this.scene.add(newChunkMesh);
+
+      // 5. Update in loadedChunks map
+      this.loadedChunks.set(key, {
+        mesh: newChunkMesh,
+        lastAccessed: Date.now(),
+        lodLevel: currentLodLevel 
+      });
+
+      if (import.meta.env.DEV) {
+        console.debug(`Chunk ${key} re-meshed successfully after block change.`);
+      }
+      return true;
+    } catch (error) {
+      console.error(`Error re-meshing chunk ${key} after block change:`, error);
+      // If an error occurs during re-meshing, the old mesh might still be in the scene (if it wasn't removed yet) 
+      // or was removed just before this catch. This part is tricky.
+      // If we didn't remove the oldMesh yet, it's still there. If we did, it's gone.
+      // The current refined logic removes oldMesh *after* meshData is available but *before* this catch block if an error occurs in geometry creation.
+      // So, if an error happens here, the old mesh (if it existed) has already been removed and its geometry disposed.
+      // We should ensure that if the new mesh creation fails, the chunk entry is cleaned from loadedChunks.
+      if (this.loadedChunks.has(key)){
+          const entry = this.loadedChunks.get(key);
+          // If the entry still points to the old mesh details that we intended to replace, clean it.
+          if(entry === oldChunkMeshDetails){
+             this.loadedChunks.delete(key);
+          }
+      }
+      return false;
+    }
+  }
+
   dispose(): void {
     // Clean up all chunks
     for (const [key, chunkData] of this.loadedChunks) {

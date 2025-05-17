@@ -14,7 +14,7 @@ const FPS_PITCH_MIN_RAD = THREE.MathUtils.degToRad(-89);
 const FPS_PITCH_MAX_RAD = THREE.MathUtils.degToRad(89);
 // TPS pitch might have different limits, but for now, we use the same.
 
-export function createInputLookSystem(world: IWorld, gameDocument: Document) {
+export function createInputLookSystem(world: IWorld, gameDocument: Document, debugMode: boolean) {
   let accumulatedMouseDeltaX = 0;
   let accumulatedMouseDeltaY = 0;
   // No need to accumulate wheel delta, apply immediately
@@ -51,6 +51,9 @@ export function createInputLookSystem(world: IWorld, gameDocument: Document) {
     for (const eid of entities) {
       // Update Yaw and Pitch for both FPS and TPS modes
       if (CameraTarget.mode[eid] === CameraMode.FPS || CameraTarget.mode[eid] === CameraMode.TPS) {
+        const oldYaw = CameraTarget.yaw[eid]; // Store old values for comparison
+        const oldPitch = CameraTarget.pitch[eid];
+
         CameraTarget.yaw[eid] -= accumulatedMouseDeltaX * MOUSE_SENSITIVITY_X;
         CameraTarget.pitch[eid] -= accumulatedMouseDeltaY * MOUSE_SENSITIVITY_Y;
 
@@ -59,9 +62,14 @@ export function createInputLookSystem(world: IWorld, gameDocument: Document) {
           Math.min(FPS_PITCH_MAX_RAD, CameraTarget.pitch[eid])
         );
 
-        if (accumulatedMouseDeltaX !== 0 || accumulatedMouseDeltaY !== 0) {
-          const modeStr = CameraTarget.mode[eid] === CameraMode.FPS ? 'FPS' : 'TPS';
-          console.log(`InputLookSystem: Entity ${eid} ${modeStr} - Yaw: ${THREE.MathUtils.radToDeg(CameraTarget.yaw[eid]).toFixed(2)}°, Pitch: ${THREE.MathUtils.radToDeg(CameraTarget.pitch[eid]).toFixed(2)}°`);
+        // Log only if in debugMode and if there was an actual change in yaw/pitch due to mouse input
+        if (debugMode && (accumulatedMouseDeltaX !== 0 || accumulatedMouseDeltaY !== 0)) {
+          // Further check if yaw or pitch actually changed after sensitivity & clamping, 
+          // though mouse delta check is usually sufficient for "intent to look"
+          if (CameraTarget.yaw[eid] !== oldYaw || CameraTarget.pitch[eid] !== oldPitch) {
+            const modeStr = CameraTarget.mode[eid] === CameraMode.FPS ? 'FPS' : 'TPS';
+            // console.log(`InputLookSystem: Entity ${eid} ${modeStr} - Yaw: ${THREE.MathUtils.radToDeg(CameraTarget.yaw[eid]).toFixed(2)}°, Pitch: ${THREE.MathUtils.radToDeg(CameraTarget.pitch[eid]).toFixed(2)}° (DeltaX: ${accumulatedMouseDeltaX}, DeltaY: ${accumulatedMouseDeltaY})`);
+          }
         }
       }
     }
