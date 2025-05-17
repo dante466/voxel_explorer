@@ -91,7 +91,8 @@ scene.add(playerModelMesh);
 // Initialize managers (needs to be before CameraSystem if it uses chunkManager)
 const noiseManager = new NoiseManager(12345);
 const mesherManager = new MesherManager();
-const chunkManager = new ChunkManager(noiseManager, mesherManager, scene, 4, 100, 5);
+// Pass null for the socket initially; NetworkManager will set it later.
+const chunkManager = new ChunkManager(noiseManager, mesherManager, scene, null, 4, 100, 5);
 
 // NOW Initialize Camera System, passing playerModelMesh and chunkManager
 const cameraSystemManager = createCameraSystem(world, scene, initialAspect, window, playerModelMesh, chunkManager);

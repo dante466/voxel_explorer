@@ -104,10 +104,18 @@ A hyper-performant, desktop-web voxel game with procedurally generated terrain. 
        -   Current: `matchServer.ts` has basic input handling but lacks full Rapier physics integration for player movement, collision, and state updates. `PlayerMovementSystem.ts` on client is more advanced.
        -   Recommendation: Implement server-side player entity management, apply inputs to physics bodies, step Rapier world, and broadcast authoritative states.
 
-   2.  **Networking - FlatBuffers & Optimization (Medium-High Priority):**
+   2.  **Networking - FlatBuffers & Optimization (Initial Bootstrap S0-1 COMPLETE, Integration Pending):**
        -   Tech Spec: FlatBuffers for binary data, chunk diff LZ4 (post-MVP).
-       -   Current: JSON messaging. `WebSocketClient.ts` has a TODO for FlatBuffers.
-       -   Recommendation: Implement FlatBuffers for all client-server communication to reduce bandwidth and parsing overhead.
+       -   Current: JSON messaging for primary communication.
+       -   **S0-1 Milestone (FlatBuffers Bootstrap) - COMPLETE:**
+           -   A FlatBuffers schema (`src/schema/game.fbs`) defining `Vec3`, `PlayerState`, and `StateSnapshot` (root type) has been created.
+           -   TypeScript bindings were generated using `flatc` (compiler version `flatc version 23.5.26`) with the `--ts` and `--gen-object-api` flags.
+           -   Helper functions (`encodeStateSnapshot`, `decodeStateSnapshot` using the Object API) and corresponding Jest/Vitest tests (`src/net/flat.test.ts`) have been implemented and are passing.
+           -   **Timestamp (`Int64`/`BigInt`) Issue Resolution:** An initial issue where `timestamp` fields were decoded as `0n` was resolved by:
+               1.  Ensuring the `flatbuffers` runtime dependency in `package.json` was `^23.5.26`.
+               2.  Regenerating schema code with the `--gen-object-api` flag.
+               3.  Utilizing the Object API pattern for encoding and decoding, which correctly handles `BigInt` for `Int64` types.
+       -   Recommendation: Integrate the created FlatBuffers (de)serialization helpers into the main client-server communication path (`WebSocketClient.ts` and `matchServer.ts`) to replace JSON for state updates and relevant commands.
 
    3.  **Meshing - Greedy Meshing (Medium Priority):**
        -   Tech Spec: Greedy mesher worker (SURF algorithm).
@@ -152,7 +160,7 @@ A hyper-performant, desktop-web voxel game with procedurally generated terrain. 
 5. Key Issues & Recommendations (Overall Priority Order - Combining above with general observations):
 
    1.  **Server-Side Authoritative Player Movement & Physics (CRITICAL):** The largest gap for core gameplay. Implement full Rapier physics on the server for player movement, collisions, and state updates. (Corresponds to #1 in TODOs)
-   2.  **Networking Enhancements - FlatBuffers (HIGH):** Essential for performance and scalability as per tech spec. (Corresponds to #2 in TODOs)
+   2.  **Networking Enhancements - FlatBuffers Integration (HIGH):** Essential for performance and scalability as per tech spec. Integrate the S0-1 FlatBuffers bootstrap into the live communication pipeline. (Corresponds to #2 in TODOs)
    3.  **Greedy Meshing (HIGH):** Critical for client rendering performance with larger views or more complex chunks. (Corresponds to #3 in TODOs)
    4.  **Lobby & Match Management (MEDIUM-HIGH):** Required for multiplayer matches as envisioned in tech spec. (Corresponds to #6 in TODOs)
    5.  **Camera System Refinements (MEDIUM):** Polish player experience (TPS controls, lerping, collision). (Corresponds to #5 in TODOs)
@@ -164,3 +172,58 @@ A hyper-performant, desktop-web voxel game with procedurally generated terrain. 
        - Address any remaining client-side prediction inaccuracies, especially around `yVelocity` in `NetworkManager.ts` reconciliation. The comment "This is a known simplification for now" regarding yVelocity implies it's an area for improvement.
 
 (This document should be regularly updated as the project evolves. Timestamp and versioning are recommended.) 
+
+**MILESTONE S1: SERVER-SIDE WORLD & CHUNK MANAGEMENT**
+
+*   **S1-1: Server ECS Bootstrap & Heightmap Consistency Test - COMPLETE**
+    *   **Server ECS (`src/server/ecs/world.ts`):**
+        *   Created `createServerECSWorld` factory using `bitecs`.
+        *   Defined components: `Position`, `Rotation`, `Velocity`, `NetworkId`. (PhysicsBodyId, PlayerInput were also defined but might be pending full server-side physics integration).
+        *   Integrated into `matchServer.ts`: ECS world initialized, entities created/removed on player connect/disconnect.
+    *   **Heightmap Consistency Test (`src/server/world/chunkValidation.ts`, `matchServer.ts`):**
+        *   Implemented `testS1_1_HeightmapConsistency` to compare server-generated chunk heightmaps (from `genChunk.ts`) against a replication of client logic.
+        *   **Initial Failures & Debugging:**
+            1.  Server's `genChunk.ts` initially produced flat heightmaps.
+            2.  Refactored `genChunk.ts` and `src/server/world/heightAt.ts` to use new shared noise constants (`src/shared/terrainConsts.ts`) and a specific multi-octave noise formula (`makeNoise2D` with `mulberry32` PRNG for deterministic seeding).
+            3.  Aligned `replicateClientHeightmapGen` in `chunkValidation.ts` with this new "mommy engineer" terrain specification.
+        *   **Outcome:** Test now PASSES, confirming server can generate chunk (0,0) with a heightmap identical to the client's updated specification.
+
+*   **S1-2: Pre-warm Initial Chunks (Server) - COMPLETE (but temporarily disabled for S1-3 testing)**
+    *   Implemented in `matchServer.ts` to generate a 3x3 chunk area around (0,0) on server startup using `genChunk`.
+    *   Logs timing and success. (Currently commented out to facilitate S1-3 on-demand loading tests).
+
+*   **S1-3: On-Demand Chunk Loader (Server Logic & Client Integration) - COMPLETE**
+    *   **Server-Side Logic (Previously Implemented):**
+        *   `src/server/world/getOrCreateChunk.ts`: Contains `getOrCreateChunk(state, seed, cx, cz)` which calls `genChunk` if a chunk is missing and caches it in `matchState.chunks`.
+        *   `src/server/world/voxelIO.ts`: `getBlock` and `setBlock` were updated to use `getOrCreateChunk`, making block modifications trigger on-demand generation.
+        *   `src/server/matchServer.ts`: Implemented a `chunkRequest` message handler that uses `getOrCreateChunk` to fetch/generate chunk data and sends it back to the client in a `chunkResponse` message (voxel data as `Array.from(chunk.data)`).
+    *   **Client-Side Integration (`src/world/ChunkManager.ts`, `src/net/NetworkManager.ts`, `src/net/WebSocketClient.ts`):**
+        *   **Goal:** Client requests chunk data from the server for rendering new areas, instead of relying solely on its local `NoiseManager` for generation.
+        *   **`ChunkManager.ts` Modifications:**
+            *   Constructor now accepts a `WebSocket | null` instance (passed as `null` from `main.tsx` initially).
+            *   Added `public setSocket(socket: WebSocket)` method, allowing `NetworkManager` to provide the live socket post-connection.
+            *   `loadChunk()` method now calls a new private method `requestChunkDataFromServer(cx, cz, lodLevel)`.
+            *   `requestChunkDataFromServer()`:
+                *   Sends a `chunkRequest` JSON message (e.g., `{ type: 'chunkRequest', cx, cz }`) to the server via the WebSocket.
+                *   Manages pending requests using a `Map` (`pendingChunkRequests`) storing Promises, to avoid redundant requests and handle server responses.
+                *   Includes a 10-second timeout for server responses. On timeout (or if WebSocket is initially unavailable), it falls back to local generation using `this.noiseManager.generateChunk()`.
+            *   Added `public handleChunkResponse(cx, cz, voxels)`:
+                *   Called by `NetworkManager` when a `chunkResponse` message is received from the server.
+                *   Creates a new `Chunk` object.
+                *   Populates the chunk's voxel data using `chunk.setData(new Uint8Array(voxels))`.
+                *   Resolves the corresponding Promise in `pendingChunkRequests`.
+            *   Added `public handleChunkResponseError(cx, cz, reason)`:
+                *   Called by `NetworkManager` for `chunkResponseError` messages.
+                *   Rejects the corresponding Promise.
+        *   **`NetworkManager.ts` Modifications:**
+            *   Constructor updated to pass an `onOpenCallback` to `WebSocketClient`.
+            *   This `onOpenCallback` is: `(socket) => { if (this.chunkManager) { this.chunkManager.setSocket(socket); } }`.
+            *   The main `wsClient.onMessage` handler in `NetworkManager` now checks for message types `chunkResponse` and `chunkResponseError`. If detected, it calls `this.chunkManager.handleChunkResponse(...)` or `this.chunkManager.handleChunkResponseError(...)` respectively.
+        *   **`WebSocketClient.ts` Modifications:**
+            *   Constructor now accepts an optional `onOpenCallback: (socket: WebSocket) => void`.
+            *   In its internal `this.ws.onopen` handler, if this callback is provided, it's called with the active `WebSocket` instance.
+    *   **Verification:**
+        *   Server logs confirm receipt of `chunkRequest` from client, generation/caching by `getOrCreateChunk`, and sending of `chunkResponse`.
+        *   Client logs confirm sending of `chunkRequest`, receipt and processing of `chunkResponse` from server, and subsequent loading/meshing of the chunk using server-provided data.
+        *   Fallback to local generation on timeout/no-socket was also included in the `ChunkManager` logic.
+        *   This makes chunk loading for viewing server-authoritative, fulfilling S1-3. 

@@ -11,9 +11,13 @@ export class WebSocketClient {
   private reconnectTimeout: number | null = null;
   private url: string;
   public onMessage: ((message: string) => void) | null = null;
+  public onOpenCallback: ((socket: WebSocket) => void) | null = null;
 
-  constructor(url: string) {
+  constructor(url: string, onOpenCallback?: (socket: WebSocket) => void) {
     this.url = url;
+    if (onOpenCallback) {
+      this.onOpenCallback = onOpenCallback;
+    }
   }
 
   public connect(): void {
@@ -36,6 +40,9 @@ export class WebSocketClient {
       this.connectionState.isConnected = true;
       this.connectionState.reconnectAttempts = 0;
       this.connectionState.lastReconnectTime = Date.now();
+      if (this.onOpenCallback && this.ws) {
+        this.onOpenCallback(this.ws);
+      }
     };
 
     this.ws.onclose = () => {

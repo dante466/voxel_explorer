@@ -9,9 +9,14 @@ interface ChunkMesh {
   lodLevel: LODLevel;
 }
 
+// Define a type for the callback that will process the received chunk data
+type ChunkDataCallback = (chunk: Chunk) => void;
+
 export class ChunkManager {
   private noiseManager: NoiseManager;
   private mesherManager: MesherManager;
+  private scene: THREE.Scene;
+  private socket: WebSocket | null = null; // WebSocket for server communication
   private loadedChunks: Map<string, ChunkMesh> = new Map();
   private loadingChunks: Set<string> = new Set();
   private renderDistance: number;
@@ -29,12 +34,15 @@ export class ChunkManager {
   private batchSize: number = 2;
   private chunkHeightmaps: Map<string, Uint8Array> = new Map();
   private chunkData: Map<string, Chunk> = new Map();
-  private scene: THREE.Scene;
+
+  // For handling pending chunk requests from the server
+  private pendingChunkRequests: Map<string, { resolve: (chunk: Chunk) => void, reject: (reason?: any) => void }> = new Map();
 
   constructor(
     noiseManager: NoiseManager,
     mesherManager: MesherManager,
     scene: THREE.Scene,
+    socket: WebSocket | null, // Allow null for local fallback or testing
     renderDistance: number = 3,
     maxLoadedChunks: number = 100,
     unloadDistanceChunks?: number
@@ -42,6 +50,7 @@ export class ChunkManager {
     this.noiseManager = noiseManager;
     this.mesherManager = mesherManager;
     this.scene = scene;
+    this.socket = socket; // Store the WebSocket instance
     this.renderDistance = renderDistance;
     this.unloadDistanceChunks = unloadDistanceChunks !== undefined ? unloadDistanceChunks : renderDistance + 2;
     this.maxLoadedChunks = maxLoadedChunks;
@@ -71,7 +80,9 @@ export class ChunkManager {
 
   private getLODLevelForDistance(distance: number, chunkKey: string): LODLevel {
     const lastLOD = this.lastLODLevels.get(chunkKey);
-    const baseLOD = distance > this.lodTransitionDistance ? LODLevel.LOW : LODLevel.HIGH;
+    // const baseLOD = distance > this.lodTransitionDistance ? LODLevel.LOW : LODLevel.HIGH; 
+    // For now, let's simplify and always request HIGH LOD from server, server can decide if it sends different LODs later
+    const baseLOD = LODLevel.HIGH;
     
     // Apply hysteresis to prevent LOD flickering
     if (lastLOD !== undefined) {
@@ -106,35 +117,73 @@ export class ChunkManager {
 
   private async loadChunk(chunkX: number, chunkZ: number, scene: THREE.Scene, lodLevel: LODLevel): Promise<void> {
     const key = this.getChunkKey(chunkX, chunkZ);
-    if (this.loadedChunks.has(key) || this.loadingChunks.has(key)) return;
+    // if (this.loadedChunks.has(key) || this.loadingChunks.has(key)) return; // Original check
+    // Ensure that if a chunk is loaded, its LOD is appropriate, or reload if not.
+    const existingChunk = this.loadedChunks.get(key);
+    if (existingChunk) {
+        if (existingChunk.lodLevel === lodLevel) {
+            existingChunk.lastAccessed = Date.now(); // Update access time
+            return; // Already loaded with correct LOD
+        } else {
+            // console.log(`[Client ChunkManager] Chunk ${key} exists with LOD ${existingChunk.lodLevel}, requested ${lodLevel}. Reloading.`);
+            // Different LOD requested, unload current and reload.
+            await this.unloadChunk(key, scene); 
+            // Proceed to load with new LOD below.
+        }
+    }
+    if (this.loadingChunks.has(key)) { // Still loading, perhaps for a different LOD.
+        // This logic might need to be more sophisticated if multiple LOD requests for the same chunk can interleave.
+        // For now, if it's in loadingChunks, assume the current load process will handle it or be superseded.
+        // console.warn(`[Client ChunkManager] Chunk ${key} is already in loadingChunks set. Skipping new load attempt for LOD ${lodLevel}.`);
+        return;
+    }
 
     this.loadingChunks.add(key);
+    this.lastLODLevels.set(key, lodLevel); // Store the target LOD
     if (import.meta.env.DEV) {
-      console.debug(`Loading chunk at ${chunkX}, ${chunkZ} with LOD ${lodLevel}`);
+      // console.debug(`Loading chunk at ${chunkX}, ${chunkZ} with LOD ${lodLevel}`);
+      console.log(`[Client ChunkManager] Attempting to load chunk ${key} with LOD ${lodLevel}`);
     }
 
     try {
-      // Generate chunk data
-      const chunk = await this.noiseManager.generateChunk(chunkX, chunkZ, lodLevel);
-      if (import.meta.env.DEV) {
-        console.debug('Chunk generated:', chunk);
-      }
-
-      // Store chunk data
-      this.chunkData.set(key, chunk);
-
-      // Store heightmap
-      const heightmap = chunk.getHeightmap();
-      if (!heightmap || heightmap.length !== 1024) {
-        console.error(`Invalid heightmap for chunk ${key}`);
+      // Generate chunk data - NOW REQUESTS FROM SERVER OR FALLS BACK
+      // const chunk = await this.noiseManager.generateChunk(chunkX, chunkZ, lodLevel); // OLD WAY
+      const chunk = await this.requestChunkDataFromServer(chunkX, chunkZ, lodLevel); // NEW WAY
+      
+      if (!chunk /*|| !chunk.data*/) { // Ensure chunk is valid. Data existence checked after getting it.
+        console.error(`[Client ChunkManager] Failed to obtain valid chunk object for ${key} (LOD: ${lodLevel}). Cannot proceed.`);
+        this.loadingChunks.delete(key); // Clean up loading state
         return;
       }
-      this.chunkHeightmaps.set(key, heightmap);
+      const chunkVoxelData = chunk.getData(); // Use getData() to access voxel data for logging
+      if (!chunkVoxelData) {
+        console.error(`[Client ChunkManager] Failed to obtain valid chunk voxel data for ${key} (LOD: ${lodLevel}) after request. Cannot proceed.`);
+        this.loadingChunks.delete(key);
+        return;
+      }
+
+      if (import.meta.env.DEV) {
+        // console.debug('Chunk data obtained:', chunk);
+        console.log(`[Client ChunkManager] Chunk data obtained for ${key} (LOD: ${lodLevel}). Size: ${chunkVoxelData.length}`);
+      }
+
+      // Store chunk data (might be redundant if requestChunkDataFromServer's resolution path already does this, but good for clarity)
+      this.chunkData.set(key, chunk);
+
+      // Store heightmap (Chunk class should have a method to get/generate this from its data)
+      const heightmap = chunk.getHeightmap(); // Assuming Chunk class can provide this
+      if (!heightmap || heightmap.length !== CHUNK_SIZE.WIDTH * CHUNK_SIZE.DEPTH) {
+        console.warn(`[Client ChunkManager] Invalid or missing heightmap for chunk ${key}. Length: ${heightmap?.length}. Expected: ${CHUNK_SIZE.WIDTH * CHUNK_SIZE.DEPTH}`);
+        // Not returning, as meshing might still work, or heightmap isn't strictly critical for this step if mesher doesn't need it.
+      } else {
+        this.chunkHeightmaps.set(key, heightmap);
+      }
+      
 
       // Generate mesh
       const meshData = await this.mesherManager.meshChunk(chunk);
       if (import.meta.env.DEV) {
-        console.debug('Mesh generated:', meshData);
+        // console.debug('Mesh generated:', meshData);
       }
 
       // Create Three.js geometry
@@ -782,5 +831,112 @@ export class ChunkManager {
       meshes.push(chunkMesh.mesh);
     }
     return meshes;
+  }
+
+  public setSocket(socket: WebSocket): void {
+    this.socket = socket;
+    console.log("[Client ChunkManager] WebSocket connection established and set.");
+  }
+
+  // Method to be called when server sends chunk data
+  public handleChunkResponse(cx: number, cz: number, voxels: number[] /*, lodLevel: LODLevel - if server sends it */) {
+    const key = this.getChunkKey(cx, cz);
+    const pendingRequest = this.pendingChunkRequests.get(key);
+
+    if (pendingRequest) {
+      // Create a Chunk object from the server data
+      // Assuming LODLevel.HIGH for now, as requested. Server might send this in future.
+      const chunk = new Chunk(cx, cz, LODLevel.HIGH); 
+      const voxelData = new Uint8Array(voxels);
+      chunk.setData(voxelData); // NEW WAY - Using public setter
+
+      // TODO: Potentially re-calculate or set heightmap if needed, or if server sends it.
+      // For now, heightmap might be derived again or be part of a more complex Chunk object from server.
+      // If Chunk constructor or a method populates heightmap from data, that's fine.
+
+      console.log(`[Client ChunkManager] Received and processed chunk ${key} from server.`);
+      pendingRequest.resolve(chunk);
+      this.pendingChunkRequests.delete(key);
+    } else {
+      console.warn(`[Client ChunkManager] Received chunkResponse for ${key}, but no pending request found.`);
+      // This could happen if the request timed out client-side or was already processed.
+      // Or if the client receives an unsolicited chunk.
+      // For now, just log it. Could potentially still process and store it if needed.
+    }
+  }
+
+  public handleChunkResponseError(cx: number, cz: number, reason: string) {
+    const key = this.getChunkKey(cx, cz);
+    const pendingRequest = this.pendingChunkRequests.get(key);
+    if (pendingRequest) {
+        console.error(`[Client ChunkManager] Server error for chunk ${key}: ${reason}`);
+        pendingRequest.reject(new Error(`Server error for chunk ${key}: ${reason}`));
+        this.pendingChunkRequests.delete(key);
+    } else {
+        console.warn(`[Client ChunkManager] Received chunkResponseError for ${key}, but no pending request found.`);
+    }
+  }
+
+  private async requestChunkDataFromServer(chunkX: number, chunkZ: number, lodLevel: LODLevel): Promise<Chunk> {
+    const key = this.getChunkKey(chunkX, chunkZ);
+    
+    return new Promise((resolve, reject) => {
+      if (this.pendingChunkRequests.has(key)) {
+        // If a request for this chunk is already pending, we might return the existing promise
+        // or handle it based on desired behavior (e.g., update LOD if different).
+        // For simplicity, let's assume we don't send a duplicate request if one is flying.
+        // However, the caller of loadChunk expects a promise.
+        // This part needs careful thought if multiple calls to loadChunk for the same unloaded chunk can happen.
+        // For now, let's assume `loadChunk`'s initial check `this.loadingChunks.has(key)` prevents re-entry for active loads.
+        // If `loadingChunks` correctly gates it, we can just proceed to make a new promise.
+      }
+
+      if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+        const request = {
+          type: 'chunkRequest',
+          cx: chunkX,
+          cz: chunkZ,
+          // seq: Date.now() // Optional: for tracking, ensure it's unique
+          // lod: lodLevel // Future: send requested LOD to server
+        };
+        this.socket.send(JSON.stringify(request));
+        console.log(`[Client ChunkManager] Sent chunkRequest for ${key} (LOD: ${lodLevel})`);
+        
+        // Store the resolve/reject functions to be called when the server responds
+        this.pendingChunkRequests.set(key, { resolve, reject });
+
+        // Optional: Implement a timeout for the request
+        setTimeout(() => {
+          if (this.pendingChunkRequests.has(key)) {
+            console.warn(`[Client ChunkManager] Timeout for chunk request ${key}`);
+            // this.pendingChunkRequests.get(key)?.reject(new Error(`Timeout for chunk request ${key}`));
+            // this.pendingChunkRequests.delete(key);
+            // Fallback to local generation if timeout occurs and socket was previously available
+            if (this.noiseManager) { // Check if noiseManager is available for fallback
+                 console.warn(`[Client ChunkManager] Timeout for chunk ${key}. Falling back to local generation.`);
+                 this.noiseManager.generateChunk(chunkX, chunkZ, lodLevel)
+                     .then(resolve) // Resolve with locally generated chunk
+                     .catch(reject); // Or reject if local generation also fails
+                 this.pendingChunkRequests.delete(key); // Clean up the original pending request
+            } else {
+                 this.pendingChunkRequests.get(key)?.reject(new Error(`Timeout for chunk request ${key} and no fallback available.`));
+                 this.pendingChunkRequests.delete(key);
+            }
+          }
+        }, 10000); // 10 second timeout
+
+      } else {
+        // Fallback to local generation if WebSocket is not available
+        console.warn(`[Client ChunkManager] WebSocket not available. Falling back to local generation for chunk ${key}.`);
+        if (!this.noiseManager) {
+            const errorMsg = `[Client ChunkManager] Cannot generate chunk ${key} locally: NoiseManager not available.`;
+            console.error(errorMsg);
+            return reject(new Error(errorMsg));
+        }
+        this.noiseManager.generateChunk(chunkX, chunkZ, lodLevel)
+          .then(resolve)
+          .catch(reject);
+      }
+    });
   }
 } 

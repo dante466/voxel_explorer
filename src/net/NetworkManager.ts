@@ -48,12 +48,19 @@ export class NetworkManager {
     chunkManager: ChunkManager // Added
   ) {
     this.inputHandler = new InputHandler();
-    this.wsClient = new WebSocketClient(serverUrl);
     this.world = world;
     this.playerEntityId = playerEntityId;
     this.movementSystemControls = movementSystemControls;
     this.chunkManager = chunkManager;
     // this.camera = camera; // REMOVED
+
+    // Provide onOpen callback to WebSocketClient
+    this.wsClient = new WebSocketClient(serverUrl, (socket) => {
+      if (this.chunkManager) {
+        this.chunkManager.setSocket(socket);
+      }
+    });
+
     this.setupMessageHandler();
   }
 
@@ -62,6 +69,25 @@ export class NetworkManager {
       try {
         const data = JSON.parse(message);
         
+        // First, check for chunkManager specific messages if chunkManager is available
+        if (this.chunkManager) {
+          if (data.type === 'chunkResponse') {
+            if (typeof data.cx === 'number' && typeof data.cz === 'number' && Array.isArray(data.voxels)) {
+              this.chunkManager.handleChunkResponse(data.cx, data.cz, data.voxels.filter((v: any) => typeof v === 'number'));
+            } else {
+              console.warn('[NetworkManager] Received malformed chunkResponse:', data);
+            }
+            return; // Message handled by ChunkManager
+          } else if (data.type === 'chunkResponseError') {
+            if (typeof data.cx === 'number' && typeof data.cz === 'number' && typeof data.reason === 'string') {
+              this.chunkManager.handleChunkResponseError(data.cx, data.cz, data.reason);
+            } else {
+              console.warn('[NetworkManager] Received malformed chunkResponseError:', data);
+            }
+            return; // Message handled by ChunkManager
+          }
+        }
+
         if (data.type === 'stateUpdate' && data.state && data.state.id === this.playerEntityId) {
           const serverState = data.state;
           // console.log('Received server state:', serverState);

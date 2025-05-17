@@ -9,6 +9,7 @@ export enum ClientCommandType {
 
 export interface Player {
   id: string;
+  entityId: number;
   position: { x: number; y: number; z: number };
   rotation: { x: number; y: number; z: number };
   velocity: { x: number; y: number; z: number };
@@ -27,6 +28,7 @@ export interface MatchState {
   players: Map<string, Player>;
   chunks: Map<string, Chunk>;
   lastUpdate: number;
+  seed: number;
 }
 
 export type MessageType = 

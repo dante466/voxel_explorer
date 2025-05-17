@@ -1,27 +1,27 @@
-import { CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z, BLOCK_AIR, BLOCK_DIRT, BLOCK_STONE, AREA } from '../../shared/constants';
-// import { makeNoise2D } from 'fast-simplex-noise'; // No longer needed for flat map
-// import alea from 'alea'; // No longer needed for flat map
+import {
+  CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z,
+  BLOCK_AIR, BLOCK_DIRT, BLOCK_STONE
+} from '../../shared/constants.js';
+import { makeHeightFn } from './heightAt.js';
 
-const FLAT_GROUND_HEIGHT = 30; // Define a constant height for the flat terrain
-
-export function genChunk(seed: number, chunkX: number, chunkZ: number): { voxels: Uint8Array; lastModified: number } {
-  // Seed, chunkX, chunkZ are no longer used for generation logic but kept for signature consistency
+export function genChunk(seed: number, cx: number, cz: number) {
+  const heightFn = makeHeightFn(seed);
   const voxels = new Uint8Array(CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z);
 
-  for (let x = 0; x < CHUNK_SIZE_X; x++) {
-    for (let z = 0; z < CHUNK_SIZE_Z; z++) {
-      // worldX and worldZ are not needed for flat terrain height calculation
+  for (let lx = 0; lx < CHUNK_SIZE_X; lx++) {
+    for (let lz = 0; lz < CHUNK_SIZE_Z; lz++) {
+      const wx = cx * CHUNK_SIZE_X + lx;
+      const wz = cz * CHUNK_SIZE_Z + lz;
 
-      // Use FLAT_GROUND_HEIGHT for all columns
-      const height = FLAT_GROUND_HEIGHT;
+      const h = heightFn(wx, wz);
 
       for (let y = 0; y < CHUNK_SIZE_Y; y++) {
-        const idx = (y * AREA) + (z * CHUNK_SIZE_X) + x;
-        if (y > height) {
+        const idx = (y * CHUNK_SIZE_X * CHUNK_SIZE_Z) + (lz * CHUNK_SIZE_X) + lx;
+        if (y > h) { // Above calculated height is air
           voxels[idx] = BLOCK_AIR;
-        } else if (y > height - 4 && y <= height) { // Top 3 layers (height, height-1, height-2, height-3) up to specified height are DIRT
-          voxels[idx] = BLOCK_DIRT;
-        } else { // Below dirt layer is STONE
+        } else if (y > h - 4) { // Top 0-3 layers below or at h (e.g. h, h-1, h-2, h-3)
+          voxels[idx] = BLOCK_DIRT; 
+        } else { // Deeper layers
           voxels[idx] = BLOCK_STONE;
         }
       }
