@@ -4,7 +4,6 @@ export class InputHandler {
   private keys: Set<string> = new Set();
   private mouseX: number = 0;
   private mouseY: number = 0;
-  private isPointerLocked: boolean = false;
 
   constructor() {
     this.setupEventListeners();
@@ -17,21 +16,10 @@ export class InputHandler {
 
     // Mouse events
     document.addEventListener('mousemove', (e) => {
-      if (this.isPointerLocked) {
+      if (document.pointerLockElement) {
         this.mouseX += e.movementX;
         this.mouseY += e.movementY;
       }
-    });
-
-    // Pointer lock
-    document.addEventListener('click', () => {
-      if (!this.isPointerLocked) {
-        document.body.requestPointerLock();
-      }
-    });
-
-    document.addEventListener('pointerlockchange', () => {
-      this.isPointerLocked = document.pointerLockElement !== null;
     });
   }
 

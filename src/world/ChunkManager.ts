@@ -612,7 +612,7 @@ export class ChunkManager {
     const localZ = ((Math.floor(worldZ) % CHUNK_SIZE.DEPTH) + CHUNK_SIZE.DEPTH) % CHUNK_SIZE.DEPTH;
     const height = heightmap[localZ * CHUNK_SIZE.WIDTH + localX]; // CORRECTED INDEXING: localZ (row) * numColumns + localX (col)
     
-    console.log(`[CM getHeightAtPos] world(${worldX.toFixed(2)},${worldZ.toFixed(2)}) -> chunk(${chunkX},${chunkZ}) key(${key}) -> local(${localX},${localZ}) -> heightmap val=${height}`);
+    // console.log(`[CM getHeightAtPos] world(${worldX.toFixed(2)},${worldZ.toFixed(2)}) -> chunk(${chunkX},${chunkZ}) key(${key}) -> local(${localX},${localZ}) -> heightmap val=${height}`);
     
     return height || 64; // Fallback to sea level if height is undefined
   }

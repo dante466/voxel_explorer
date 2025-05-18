@@ -25,8 +25,9 @@ export const LOD_CHUNK_SIZE = {
 };
 
 export const BLOCK_AIR = 0;
-export const BLOCK_DIRT = 1;
-export const BLOCK_STONE = 2;
+export const BLOCK_GRASS = 1;
+export const BLOCK_DIRT = 2;
+export const BLOCK_STONE = 3;
 // Add other block types here as needed, ensuring IDs match any client-side enums/usage. 
 
 export const PLAYER_SPAWN_POS = { x: 0, y: 72, z: 0 }; 

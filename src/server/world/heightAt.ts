@@ -1,9 +1,18 @@
-import {
-  NOISE_FREQ_1, NOISE_FREQ_2, NOISE_FREQ_3,
-  NOISE_AMP_1, NOISE_AMP_2, NOISE_AMP_3,
-  BASE_HEIGHT, SEA_LEVEL, MOUNTAIN_HEIGHT
-} from '../../shared/terrainConsts.js';
 import { makeNoise2D } from 'fast-simplex-noise';
+
+// Constants previously in ../../shared/terrainConsts.js
+// Terrain Shape
+const BASE_HEIGHT = 10;
+const SEA_LEVEL = 30; // Average height of water/flat areas
+const MOUNTAIN_HEIGHT = 40; // Max height deviation from SEA_LEVEL + BASE_HEIGHT
+
+// Noise Parameters (example values, adjust as needed)
+const NOISE_FREQ_1 = 0.01; // Frequency for the first octave of noise
+const NOISE_AMP_1 = 0.6;   // Amplitude for the first octave
+const NOISE_FREQ_2 = 0.05; // Frequency for the second octave
+const NOISE_AMP_2 = 0.3;   // Amplitude for the second octave
+const NOISE_FREQ_3 = 0.1;  // Frequency for the third octave
+const NOISE_AMP_3 = 0.1;   // Amplitude for the third octave
 
 // Simple mulberry32 PRNG
 function mulberry32(a: number) {

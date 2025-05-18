@@ -119,7 +119,7 @@ export function calculatePlayerMovement(input: PlayerMovementInputState): Player
       const actualGroundSurfaceY = yOfHighestBlockBeneath + 0.5; 
       targetPlayerYOnGroundFromHeightAt = actualGroundSurfaceY + CLIENT_PLAYER_HALF_HEIGHT;
     }
-    console.log(`[PMS CalcMove] Inputs: newPos.xz(${newPos.x.toFixed(2)}, ${newPos.z.toFixed(2)}), yOfBlockBeneath: ${yOfHighestBlockBeneath}, targetPlayerYOnGroundFromHeightAt: ${targetPlayerYOnGroundFromHeightAt?.toFixed(2)}`);
+    // console.log(`[PMS CalcMove] Inputs: newPos.xz(${newPos.x.toFixed(2)}, ${newPos.z.toFixed(2)}), yOfBlockBeneath: ${yOfHighestBlockBeneath}, targetPlayerYOnGroundFromHeightAt: ${targetPlayerYOnGroundFromHeightAt?.toFixed(2)}`);
 
     // 2. Jump Logic
     let didJumpThisTick = false;

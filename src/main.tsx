@@ -136,9 +136,21 @@ async function main() {
   let serverInitialized = false;
   let clientReadyForDisplay = false;
 
-  let timeOfDay = 0.25;
+  let timeOfDay = 11 / 24; // Default to 11:00 AM (approx 0.45833)
   const DAY_NIGHT_CYCLE_SPEED = 0.00005;
   const STAR_ROTATION_SPEED = 0.005; // Radians per second for star field rotation
+
+  function formatTimeOfDay(timeFraction: number): string {
+    const totalMinutes = Math.floor(timeFraction * 24 * 60);
+    let hours = Math.floor(totalMinutes / 60) % 24;
+    const minutes = totalMinutes % 60;
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12;
+    hours = hours ? hours : 12; // the hour '0' should be '12'
+    const minutesStr = minutes < 10 ? '0' + minutes : minutes.toString();
+    return `${hours}:${minutesStr} ${ampm}`;
+  }
+
   function lerp(a: number, b: number, t: number): number { return a * (1 - t) + b * t; }
   function lerpColor(colorA: THREE.Color, colorB: THREE.Color, t: number): THREE.Color {
     const result = colorA.clone(); result.lerp(colorB, t); return result;
@@ -310,7 +322,7 @@ async function main() {
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-  renderer.domElement.setAttribute('tabindex', '-1');
+  renderer.domElement.setAttribute('tabindex', '0');
   document.body.appendChild(renderer.domElement);
   const ambientLight = new THREE.AmbientLight();
   scene.add(ambientLight);
@@ -397,7 +409,7 @@ async function main() {
     <div><label><input type="checkbox" id="crosshairToggle" checked> Crosshair</label></div>
     <div><label><input type="checkbox" id="freezeTimeToggle"> Freeze Time</label></div>
     <div>
-        <label for="timeOfDaySlider">Time of Day: <span id="timeOfDayValue">${timeOfDay.toFixed(2)}</span></label>
+        <label for="timeOfDaySlider">Time of Day: <span id="timeOfDayValue">${formatTimeOfDay(timeOfDay)}</span></label>
         <input type="range" id="timeOfDaySlider" min="0" max="1" step="0.01" value="${timeOfDay}" style="width: 100%;">
     </div>
   `;
@@ -453,16 +465,16 @@ async function main() {
   if (crosshairToggle) crosshairToggle.checked = showCrosshair;
   if (freezeTimeToggle) freezeTimeToggle.checked = isTimeFrozen;
   if (timeOfDaySlider) timeOfDaySlider.value = timeOfDay.toFixed(2);
-  if (timeOfDayValueSpan) timeOfDayValueSpan.textContent = timeOfDay.toFixed(2);
+  if (timeOfDayValueSpan) timeOfDayValueSpan.textContent = formatTimeOfDay(timeOfDay);
   flyingToggle.addEventListener('change', () => { movementSystemControls.toggleFlying(); flyingToggle.checked = movementSystemControls.isFlying(); });
   collisionToggle.addEventListener('change', (e) => { showCollisionBoxes = (e.target as HTMLInputElement).checked; });
   highlighterToggle.addEventListener('change', (e) => { showBlockHighlighter = (e.target as HTMLInputElement).checked; if (!showBlockHighlighter && voxelHighlighter) voxelHighlighter.update(null); });
   crosshairToggle.addEventListener('change', (e) => { showCrosshair = (e.target as HTMLInputElement).checked; if (crosshairElement) crosshairElement.style.display = showCrosshair ? 'block' : 'none'; });
   freezeTimeToggle.addEventListener('change', (e) => { isTimeFrozen = (e.target as HTMLInputElement).checked; });
   timeOfDaySlider.addEventListener('input', (e) => {
-    const newTime = parseFloat((e.target as HTMLInputElement).value);
-    timeOfDay = newTime;
-    if (timeOfDayValueSpan) timeOfDayValueSpan.textContent = newTime.toFixed(2);
+    const newTimeFraction = parseFloat((e.target as HTMLInputElement).value);
+    timeOfDay = newTimeFraction;
+    if (timeOfDayValueSpan) timeOfDayValueSpan.textContent = formatTimeOfDay(newTimeFraction);
   });
   const mainKeyDownHandler = (event: KeyboardEvent) => {
     switch (event.code) {
@@ -477,11 +489,40 @@ async function main() {
   };
   document.addEventListener('keydown', mainKeyDownHandler);
   renderer.domElement.addEventListener('click', () => {
-    if (!document.pointerLockElement) renderer.domElement.requestPointerLock();
+    console.log('[Main] Canvas click listener triggered.');
+    console.log('[Main] document.hasFocus():', document.hasFocus());
+    console.log('[Main] document.activeElement before changes:', document.activeElement);
+
+    if (document.activeElement && typeof (document.activeElement as HTMLElement).blur === 'function') {
+      (document.activeElement as HTMLElement).blur();
+      console.log('[Main] Blurred document.activeElement. Now activeElement is:', document.activeElement);
+    }
+
+    console.log('[Main] Focusing renderer.domElement (canvas).');
+    renderer.domElement.focus();
+    console.log('[Main] After canvas.focus(), document.activeElement is:', document.activeElement);
+
+    if (document.pointerLockElement !== renderer.domElement) {
+      console.log('[Main] Attempting to requestPointerLock on canvas. Current document.pointerLockElement:', document.pointerLockElement);
+      try {
+        renderer.domElement.requestPointerLock();
+        console.log('[Main] requestPointerLock() called on canvas (no immediate synchronous error).');
+      } catch (e) {
+        console.error('[Main] Error calling requestPointerLock():', e);
+      }
+    } else {
+      console.log('[Main] Canvas clicked, but pointer already locked to canvas.');
+    }
   });
   let isPointerLockedToCanvas = false;
-  const onPointerLockChange = () => { isPointerLockedToCanvas = (document.pointerLockElement === renderer.domElement); };
-  const onPointerLockError = () => { isPointerLockedToCanvas = false; };
+  const onPointerLockChange = () => {
+    isPointerLockedToCanvas = (document.pointerLockElement === renderer.domElement);
+    console.log('[Main] onPointerLockChange fired. document.pointerLockElement:', document.pointerLockElement, 'renderer.domElement:', renderer.domElement, 'isPointerLockedToCanvas:', isPointerLockedToCanvas);
+  };
+  const onPointerLockError = () => {
+    isPointerLockedToCanvas = false;
+    console.error('[Main] onPointerLockError fired. isPointerLockedToCanvas set to false.');
+  };
   document.addEventListener('pointerlockchange', onPointerLockChange, false);
   document.addEventListener('pointerlockerror', onPointerLockError, false);
   let stats: Stats | null = null;
@@ -498,24 +539,46 @@ async function main() {
     voxelHighlighter.update(result ? result.position : null);
   }
   function handleBlockInteraction(event: MouseEvent) {
-    if (!isPointerLockedToCanvas) return;
+    console.log('[Main] handleBlockInteraction called. Event button:', event.button); // Log 1: Function called
+
+    if (!isPointerLockedToCanvas) {
+      console.log('[Main] Pointer not locked. Exiting handleBlockInteraction.'); // Log 2: Pointer lock status
+      return;
+    }
     const now = Date.now();
     if (now - lastBlockActionTime < BLOCK_ACTION_COOLDOWN && !movementSystemControls.isFlying()) {
       if (showCrosshair && crosshairElement) crosshairElement.style.backgroundColor = 'grey';
+      console.log('[Main] Block action cooldown active. Exiting.'); // Log 3: Cooldown status
       return;
     }
     lastBlockActionTime = now;
+    console.log('[Main] Cooldown passed or flying. Proceeding.');
     if (crosshairElement) crosshairElement.style.backgroundColor = 'red';
     const centerRay = getCenterScreenRay(gameCamera);
+    if (!centerRay) {
+      console.error('[Main] getCenterScreenRay returned null. gameCamera issue?');
+      return;
+    }
     const hit = raycastVoxel(centerRay.origin, centerRay.direction, chunkManager, 10);
+    console.log('[Main] Raycast hit result:', hit); // Log 4: Raycast result
+
     if (hit && hit.voxel && hit.normal) {
-      if (event.button === 0) { networkManager.sendMineCommand(hit.voxel.x, hit.voxel.y, hit.voxel.z); }
-      else if (event.button === 2) {
+      console.log('[Main] Raycast hit valid block. Voxel:', hit.voxel, 'Normal:', hit.normal);
+      if (event.button === 0) { // Left mouse button
+        console.log('[Main] Attempting to send MINE command for voxel:', hit.voxel); // Log 5: Before sending command
+        networkManager.sendMineCommand(hit.voxel.x, hit.voxel.y, hit.voxel.z);
+      }
+      else if (event.button === 2) { // Right mouse button (for placing)
         const placePosition = new THREE.Vector3().copy(hit.voxel).add(hit.normal);
+        console.log('[Main] Attempting to send PLACE command for position:', placePosition, 'BlockID:', DEFAULT_PLACE_BLOCK_ID); // Log for placing
         networkManager.sendPlaceCommand(placePosition.x, placePosition.y, placePosition.z, DEFAULT_PLACE_BLOCK_ID);
       }
+    } else {
+      console.log('[Main] Raycast did not hit a valid block or hit data incomplete.');
     }
   }
+  // Add a log to confirm the event listener is being set up
+  console.log('[Main] Adding mousedown event listener for handleBlockInteraction.');
   document.addEventListener('mousedown', handleBlockInteraction);
   
   const clock = new THREE.Clock();
@@ -527,7 +590,7 @@ async function main() {
     if (!isTimeFrozen) {
       timeOfDay = (timeOfDay + delta * DAY_NIGHT_CYCLE_SPEED) % 1.0;
       if (timeOfDaySlider) timeOfDaySlider.value = timeOfDay.toFixed(2);
-      if (timeOfDayValueSpan) timeOfDayValueSpan.textContent = timeOfDay.toFixed(2);
+      if (timeOfDayValueSpan) timeOfDayValueSpan.textContent = formatTimeOfDay(timeOfDay);
     }
 
     const sunAngle = (timeOfDay - 0.25) * Math.PI * 2;
