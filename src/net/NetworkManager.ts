@@ -137,55 +137,25 @@ export class NetworkManager {
                 Transform.position.y[this.playerEntityId],
                 Transform.position.z[this.playerEntityId]
               );
-              const clientPredYVel = this.movementControls.getCurrentYVelocity();
-              const clientPredHVel = this.movementControls.getCurrentHorizontalVelocity();
-              const clientPredIsFlying = this.movementControls.isFlying();
-              const clientPredIsOnGround = this.movementControls.isOnGround();
-
               const predictionError = clientPredPos.distanceTo(serverPos);
-              const lastAckFromServer = playerState.lastAck();
 
-              // Enhanced logging for significant prediction errors (potential rubber-band trigger)
-              if (predictionError > 0.1) { // Log if error is > 10cm
-                console.warn("---------------- SRV CORRECTION (Rubber Band?) ----------------");
-                console.log(`[NetMan Correction] Server Tick: ${snapshot.tick()}, Player ID: ${this.currentServerPlayerId}`);
-                console.log(`  SERVER Authoritative State:`);
-                console.log(`    Pos: {x: ${serverPos.x.toFixed(3)}, y: ${serverPos.y.toFixed(3)}, z: ${serverPos.z.toFixed(3)}}`);
-                console.log(`    Vel: {x: ${serverVel.x.toFixed(3)}, y: ${serverVel.y.toFixed(3)}, z: ${serverVel.z.toFixed(3)}}`);
-                console.log(`    isGrounded (Srv): ${playerIsGrounded}, lastAck (Srv): ${lastAckFromServer}`);
-                console.log(`  CLIENT Predicted State (before correction):`);
-                console.log(`    Pos: {x: ${clientPredPos.x.toFixed(3)}, y: ${clientPredPos.y.toFixed(3)}, z: ${clientPredPos.z.toFixed(3)}}`);
-                console.log(`    yVel (Cli): ${clientPredYVel.toFixed(3)}, hVel (Cli): {x: ${clientPredHVel.x.toFixed(3)}, z: ${clientPredHVel.y.toFixed(3)}}`);
-                console.log(`    isFlying (Cli): ${clientPredIsFlying}, isOnGround (Cli): ${clientPredIsOnGround}`);
-                console.log(`  DIAGNOSTICS:`);
-                console.log(`    Prediction Error: ${predictionError.toFixed(3)}m`);
-                console.log(`    Pending Inputs (seq numbers): [${this.pendingInputs.map(p => p.seq).join(', ')}]`);
-                console.warn("---------------- END SRV CORRECTION LOG ----------------");
-              }
-              // The old DLOG-1 throttle can be removed or kept if preferred for less critical errors
-              // this.snapshotErrorLogThrottle++;
-              // if (this.snapshotErrorLogThrottle >= 5 || predictionError > 0.1) { 
-              //   console.log(`[NetMan C4-1 PredictErr] ServerPos: (${serverPos.x.toFixed(2)}, ${serverPos.y.toFixed(2)}, ${serverPos.z.toFixed(2)}), ClientPred: (${clientPredPos.x.toFixed(2)}, ${clientPredPos.y.toFixed(2)}, ${clientPredPos.z.toFixed(2)}), Error: ${predictionError.toFixed(3)}m`);
-              //   this.snapshotErrorLogThrottle = 0; 
+              // Reverted: The enhanced logging and test-specific correction logic (if blocks based on predictionError) are removed.
+              // Original logic to apply server's state directly:
+              Transform.position.x[this.playerEntityId] = serverPos.x;
+              Transform.position.y[this.playerEntityId] = serverPos.y;
+              Transform.position.z[this.playerEntityId] = serverPos.z;
+              
+              // Also update client's local yVelocity and horizontalVelocity if server sends them and if it was original logic.
+              // For now, assuming server position is the main thing to correct as per earlier state.
+              // if (serverVel) { // Check if serverVel is available from snapshot
+              //    this.movementControls.setCurrentYVelocity(serverVel.y);
+              //    this.movementControls.setCurrentHorizontalVelocity(new THREE.Vector2(serverVel.x, serverVel.z));
               // }
 
-              // Correction logic (snap or lerp)
-              if (predictionError > 2.0) { 
-                Transform.position.x[this.playerEntityId] = serverPos.x;
-                Transform.position.y[this.playerEntityId] = serverPos.y;
-                Transform.position.z[this.playerEntityId] = serverPos.z;
-              } else if (predictionError > 0.01) { // Only lerp if error is > 1cm to avoid micro-adjustments fighting prediction
-                const lerpFactor = predictionError > 0.5 ? 0.5 : 0.25; // Stronger lerp for larger errors
-                clientPredPos.lerp(serverPos, lerpFactor); 
-                Transform.position.x[this.playerEntityId] = clientPredPos.x;
-                Transform.position.y[this.playerEntityId] = clientPredPos.y;
-                Transform.position.z[this.playerEntityId] = clientPredPos.z;
-              }
-              
               // Use playerState.lastAck() for sequence number processing
               // const lastProcessed = playerState.lastAck(); // Already got this as lastAckFromServer
-              if (typeof lastAckFromServer === 'number') {
-                  this.localPlayerLastProcessedInputSeq = lastAckFromServer;
+              if (typeof playerState.lastAck() === 'number') {
+                  this.localPlayerLastProcessedInputSeq = playerState.lastAck();
                   this.pendingInputs = this.pendingInputs.filter(
                       (input) => input.seq > this.localPlayerLastProcessedInputSeq
                   );
@@ -309,12 +279,18 @@ export class NetworkManager {
     if (this.chunkManager) {
       if (message.type === 'chunkResponse') {
         if (typeof message.cx === 'number' && typeof message.cz === 'number' && Array.isArray(message.voxels)) {
-          this.chunkManager.handleChunkResponse(message.cx, message.cz, message.voxels.filter((v: any) => typeof v === 'number'));
+          this.chunkManager.handleChunkResponse(
+            message.cx, 
+            message.cz, 
+            message.voxels.filter((v: any) => typeof v === 'number'),
+            message.lod,
+            message.seq // Pass sequence number
+          );
         } else { console.warn('[NetworkManager] Malformed chunkResponse:', message); }
         return;
       } else if (message.type === 'chunkResponseError') {
         if (typeof message.cx === 'number' && typeof message.cz === 'number' && typeof message.reason === 'string') {
-          this.chunkManager.handleChunkResponseError(message.cx, message.cz, message.reason);
+          this.chunkManager.handleChunkResponseError(message.cx, message.cz, message.seq, message.reason); // Pass sequence number
         } else { console.warn('[NetworkManager] Malformed chunkResponseError:', message); }
         return;
       }

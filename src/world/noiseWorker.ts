@@ -1,5 +1,5 @@
 import { makeNoise2D, makeNoise3D } from 'fast-simplex-noise';
-import { LODLevel, CHUNK_SIZE, LOD_CHUNK_SIZE } from './Chunk';
+import { LODLevel, CHUNK_SIZE, LOD_CHUNK_SIZE } from '../shared/constants.js';
 
 // Message types
 interface GenerateChunkMessage {

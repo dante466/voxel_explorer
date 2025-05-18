@@ -6,7 +6,7 @@ import { CameraTarget } from '../components/CameraTarget';
 import { type ChunkManager } from '../../world/ChunkManager';
 import { FIXED_DT_S } from '../../time/fixedStep.js';
 import { resolveAABBvoxelCollision } from '../../physics/voxelCollide';
-import { CHUNK_SIZE } from '../../world/Chunk.js'; // Added for Triage Kit 2-B helper
+import { CHUNK_SIZE } from '../../shared/constants.js'; // Added for Triage Kit 2-B helper
 
 export const PLAYER_SPEED_GROUND = 6.0; // meters/second (Aligned with server MAX_SPEED)
 export const PLAYER_SPEED_FLYING = 10.0; // meters/second

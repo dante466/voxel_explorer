@@ -3,6 +3,7 @@ import type { PhysicsWorld } from './physics.js';
 export type { PhysicsWorld };
 import type { Player as SharedPlayer } from '../shared/types.js'; // Import SharedPlayer
 export type { SharedPlayer }; // Re-export SharedPlayer
+import type { ChunkGenerationQueue } from './world/chunkGenerationQueue.js'; // Added import
 
 // Server-specific player type
 export interface PlayerServer extends SharedPlayer {
@@ -38,6 +39,8 @@ export interface MatchState {
   seed: number;
   physicsWorld?: PhysicsWorld;
   pendingColliders: (() => void)[];
+  handlesPendingRemoval?: number[]; // Added for controlled collider removal
+  chunkGenQueue: ChunkGenerationQueue; // Made non-optional
 }
 
 export type MessageType = 

@@ -1,91 +1,73 @@
-import { removeChunkColliders } from '../physics/removeChunkColliders.js';
+// import { removeChunkColliders } from '../physics/removeChunkColliders.js'; // No longer used here
 import { CHUNK_SIZE_X, CHUNK_SIZE_Z } from '../../shared/constants.js';
 import type { MatchState, PlayerServer as Player, Chunk as ServerChunk } from '../types.js';
 import type RAPIER from '@dimforge/rapier3d-compat';
 
-const GC_RADIUS = 160; // metres. Chunks outside this radius from ALL players may be GC'd.
+const GC_RADIUS = 500; // metres. Chunks outside this radius from ALL players may be GC'd.
 const GC_RADIUS_SQUARED = GC_RADIUS * GC_RADIUS;
 
 /**
- * Sweeps through loaded chunks and queues colliders for removal if no player is nearby.
- * Also removes the chunk data from state.chunks.
+ * Identifies inactive chunks, removes them from state, and queues their collider handles for controlled removal.
  */
 export function sweepInactiveChunks(
-  world: RAPIER.World, // Rapier world for removeChunkColliders
+  _world: RAPIER.World, // Rapier world is no longer directly used here for removal
   state: MatchState,
-  // seed: number // Seed is not used in this function currently
 ): {
   removedChunkCount: number;
-  removedColliderCount: number;
+  colliderHandlesQueuedForRemoval: number;
 } {
-  const chunksToDeleteKeys: string[] = [];
-  let totalCollidersRemovedCount = 0;
-
-  // console.log(`[ChunkGC] Starting sweep. Total chunks: ${state.chunks.size}. Players: ${state.players.size}`);
+  const chunksToDelete: { key: string, chunk: ServerChunk }[] = [];
+  let handlesCount = 0;
 
   if (state.players.size === 0) {
-    // No players online, remove all chunks with colliders
-    // console.log('[ChunkGC] No players online. Scheduling all loaded chunks for GC.');
     for (const [key, chunk] of state.chunks) {
-      chunksToDeleteKeys.push(key);
-      totalCollidersRemovedCount += removeChunkColliders(world, state, chunk);
+      chunksToDelete.push({ key, chunk });
     }
   } else {
-    // Iterate over chunks to find those far from all players
     outerChunkLoop: for (const [key, chunk] of state.chunks) {
-      const [cxStr, czStr] = key.split(',');
+      const [cxStr, czStr] = key.split(','); // Assumes key format cx,cz,LOD
       const cx = parseInt(cxStr, 10);
       const cz = parseInt(czStr, 10);
-
-      // Calculate chunk center world coordinates
       const chunkWorldX = (cx + 0.5) * CHUNK_SIZE_X;
       const chunkWorldZ = (cz + 0.5) * CHUNK_SIZE_Z;
 
-      // Check against each player
       for (const player of state.players.values()) {
-        // Get player's physics body
-        if (player.bodyHandle === undefined) {
-          // console.warn(`[ChunkGC] Player ${player.id} has no bodyHandle, skipping for distance check.`);
-          continue; // Skip this player if their bodyHandle isn't set
-        }
+        if (player.bodyHandle === undefined) continue;
         const playerBody = state.physicsWorld?.raw.getRigidBody(player.bodyHandle);
-
-        if (!playerBody) {
-          // console.warn(`[ChunkGC] Player ${player.id} has no physics body, skipping for distance check.`);
-          continue; // Skip this player if their body doesn't exist for some reason
-        }
-
+        if (!playerBody) continue;
         const playerPosition = playerBody.translation();
-        
         const dx = playerPosition.x - chunkWorldX;
         const dz = playerPosition.z - chunkWorldZ;
-        
         if ((dx * dx + dz * dz) < GC_RADIUS_SQUARED) {
-          // This chunk is near at least one player, so keep it.
-          continue outerChunkLoop; 
+          continue outerChunkLoop;
         }
       }
-
-      // If we reach here, the chunk is not near any player.
-      // console.log(`[ChunkGC] Chunk ${key} is far from all players. Scheduling for GC.`);
-      chunksToDeleteKeys.push(key);
-      totalCollidersRemovedCount += removeChunkColliders(world, state, chunk);
+      chunksToDelete.push({ key, chunk });
     }
   }
 
   let actualDeletedChunkCount = 0;
-  for (const key of chunksToDeleteKeys) {
+  if (!state.handlesPendingRemoval) {
+    state.handlesPendingRemoval = []; // Ensure queue exists
+  }
+
+  for (const { key, chunk } of chunksToDelete) {
+    if (chunk.colliderHandles && chunk.colliderHandles.length > 0) {
+      state.handlesPendingRemoval.push(...chunk.colliderHandles);
+      handlesCount += chunk.colliderHandles.length;
+      chunk.colliderHandles = []; // Clear handles on the chunk object
+    }
     if (state.chunks.delete(key)) {
       actualDeletedChunkCount++;
     }
   }
 
   if (actualDeletedChunkCount > 0) {
-    console.log(`[ChunkGC] Removed ${totalCollidersRemovedCount} colliders from ${actualDeletedChunkCount} chunks. Pending queue: ${state.pendingColliders.length}. Active chunks: ${state.chunks.size}`);
+    console.log(`[ChunkGC] Deleted ${actualDeletedChunkCount} chunks. Queued ${handlesCount} collider handles for removal. Current pending removal queue size: ${state.handlesPendingRemoval.length}. Active chunks: ${state.chunks.size}`);
   }
 
   return {
     removedChunkCount: actualDeletedChunkCount,
-    removedColliderCount: totalCollidersRemovedCount,
+    colliderHandlesQueuedForRemoval: handlesCount,
   };
 } 

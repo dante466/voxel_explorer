@@ -23,7 +23,7 @@ export function removeChunkColliders(
         const collider = world.getCollider(handle);
         if (collider) { // Check if collider still exists before trying to remove
             // The second argument to removeCollider when passing a Collider object is 'wakeUp'
-            world.removeCollider(collider, false); // Typically false if parent body management is separate or implicit
+            world.removeCollider(collider, true); // Typically false if parent body management is separate or implicit
         } else {
             // console.warn(`[Physics/RemoveColliders] Attempted to remove already removed/invalid collider handle: ${handle} for chunk ${chunk.x},${chunk.z}`);
         }

@@ -1,22 +1,25 @@
-export const CHUNK_SIZE = {
-  WIDTH: 32,
-  HEIGHT: 128,
-  DEPTH: 32
-};
+import { CHUNK_SIZE, LOD_CHUNK_SIZE, LODLevel } from '../shared/constants.js';
 
-export const LOD_CHUNK_SIZE = {
-  WIDTH: 16,
-  HEIGHT: 16,
-  DEPTH: 16
-};
+// export const CHUNK_SIZE = { // REMOVED LOCAL DEFINITION
+//   WIDTH: 32,
+//   HEIGHT: 128,
+//   DEPTH: 32
+// };
 
+// export const LOD_CHUNK_SIZE = { // REMOVED LOCAL DEFINITION
+//   WIDTH: 16,
+//   HEIGHT: 16,
+//   DEPTH: 16
+// };
+
+// Use imported constants for volume calculation if needed, or define them here based on imported CHUNK_SIZE/LOD_CHUNK_SIZE
 export const CHUNK_VOLUME = CHUNK_SIZE.WIDTH * CHUNK_SIZE.HEIGHT * CHUNK_SIZE.DEPTH;
 export const LOD_CHUNK_VOLUME = LOD_CHUNK_SIZE.WIDTH * LOD_CHUNK_SIZE.HEIGHT * LOD_CHUNK_SIZE.DEPTH;
 
-export enum LODLevel {
-  HIGH = 0,  // 32x128x32
-  LOW = 1    // 16x64x16
-}
+// export enum LODLevel { // REMOVED LOCAL DEFINITION
+//   HIGH = 0,  // 32x128x32
+//   LOW = 1    // 16x64x16 -> Note: comment was 16x64x16, but LOD_CHUNK_SIZE.HEIGHT is 16.
+// }
 
 export class Chunk {
   private data: Uint8Array;
@@ -163,65 +166,58 @@ export class Chunk {
 
   // New method to regenerate heightmap
   private regenerateHeightmapFromData(): void {
-    const size = this.getSizeConstants(); // Use LOD-aware sizes for iterating data
-    const heightmapSize = CHUNK_SIZE.WIDTH * CHUNK_SIZE.DEPTH; // Heightmap is always 32x32 as per current init
+    const currentChunkSize = this.getSizeConstants(); // LOD-aware size of this.data (e.g., 16xH_lowx16 or 32xH_highx32)
+    const targetHeightmapWidth = CHUNK_SIZE.WIDTH; // Always 32 for the target heightmap
+    const targetHeightmapDepth = CHUNK_SIZE.DEPTH; // Always 32 for the target heightmap
 
-    if (this.heightmap.length !== heightmapSize) {
-      // This case should ideally not happen if constructor is consistent, but as a safeguard:
-      console.warn(`[Chunk] Heightmap has unexpected size (${this.heightmap.length}), re-initializing to ${heightmapSize}. LOD: ${this.lodLevel}`);
-      this.heightmap = new Uint8Array(heightmapSize);
+    if (this.heightmap.length !== targetHeightmapWidth * targetHeightmapDepth) {
+      console.warn(`[Chunk] Heightmap has unexpected size (${this.heightmap.length}), re-initializing to ${targetHeightmapWidth * targetHeightmapDepth}. LOD: ${this.lodLevel}`);
+      this.heightmap = new Uint8Array(targetHeightmapWidth * targetHeightmapDepth);
     }
     
-    // If chunk data is LOW LOD, we might need a strategy to map it to a HIGH LOD 32x32 heightmap,
-    // or the heightmap itself should be LOD-aware in size.
-    // For now, assuming we generate a 32x32 heightmap.
-    // If size.WIDTH/DEPTH are different from CHUNK_SIZE.WIDTH/DEPTH (i.e. LOW LOD), this will be problematic.
-    // Let\'s proceed with assumption that heightmap is always based on CHUNK_SIZE (32x32) for now.
-    // And that voxel data, even if LOW_LOD, will be iterated in a way that can inform this.
+    // Scaling factor if this chunk's data is smaller than the target heightmap dimensions
+    // e.g., if chunk is 16wide (LOW_LOD) and heightmap is 32wide, scale is 32/16 = 2.
+    const xScale = targetHeightmapWidth / currentChunkSize.WIDTH;
+    const zScale = targetHeightmapDepth / currentChunkSize.DEPTH;
 
-    // Simplification: if this is a LOW_LOD chunk, this heightmap generation will be incorrect
-    // as it assumes iteration up to CHUNK_SIZE.HEIGHT using CHUNK_SIZE.WIDTH/DEPTH for indexing into heightmap.
-    // This needs refinement if LOW_LOD chunks are actively used with this heightmap logic.
-    // For S1-3, client requests HIGH LOD, so this should be okay for now.
-    
-    for (let lx = 0; lx < CHUNK_SIZE.WIDTH; lx++) { // Renamed x to lx to avoid conflict with this.x
-      for (let lz = 0; lz < CHUNK_SIZE.DEPTH; lz++) { // Renamed z to lz to avoid conflict with this.z
-        let yMax = 0; // Default to 0 if no solid block found
-        
-        // DEBUG LOGGING START
-        if (this.x === -1 && this.z === -1 && lx === 31 && lz === 21 && import.meta.env.DEV) {
-          console.log(`[HMap Scan Entry] Chunk(${this.x},${this.z}) Col(${lx},${lz}) --- Begin Y Scan ---`);
-        }
-        // DEBUG LOGGING END
+    for (let hx = 0; hx < targetHeightmapWidth; hx++) { // Iterate over target 32x32 heightmap grid
+      for (let hz = 0; hz < targetHeightmapDepth; hz++) {
+        // Map target heightmap coordinates (hx, hz) back to the chunk's local data coordinates (lx, lz)
+        // If HIGH LOD, xScale/zScale is 1, so lx=hx, lz=hz.
+        // If LOW LOD (e.g. 16wide data for 32wide map), lx = hx / 2.
+        const lx = Math.floor(hx / xScale);
+        const lz = Math.floor(hz / zScale);
 
-        for (let y = size.HEIGHT - 1; y >= 0; y--) {
-          const voxelValue = this.getVoxel(lx, y, lz); 
-          
-          // DEBUG LOGGING START
-          if (this.x === -1 && this.z === -1 && lx === 31 && lz === 21 && (y >= 98 && y <= 101) && import.meta.env.DEV) {
-            console.log(`[HMap Scan Detail] Chunk(${this.x},${this.z}) Col(${lx},${lz}) Y=${y}, Voxel=${voxelValue}`);
-          }
-          // DEBUG LOGGING END
-          
+        let yMax = 0;
+        // Scan down from the top of this chunk's actual data height
+        for (let ly = currentChunkSize.HEIGHT - 1; ly >= 0; ly--) {
+          // getVoxel uses lx, ly, lz which are in the coordinate space of this.data
+          const voxelValue = this.getVoxel(lx, ly, lz); 
           if (voxelValue !== 0) { 
-            yMax = y;
-            // DEBUG LOGGING START
-            if (this.x === -1 && this.z === -1 && lx === 31 && lz === 21 && import.meta.env.DEV) {
-              console.log(`[HMap Scan FoundSolid] Chunk(${this.x},${this.z}) Col(${lx},${lz}) Solid at Y=${y}. Set yMax=${yMax}. Breaking.`);
-            }
-            // DEBUG LOGGING END
+            yMax = ly; // yMax is in the local ly coordinate system of the chunk data
             break;
           }
         }
-        // DEBUG LOGGING START
-        if (this.x === -1 && this.z === -1 && lx === 31 && lz === 21 && import.meta.env.DEV) {
-          console.log(`[HMap Scan Result] Chunk(${this.x},${this.z}) Col(${lx},${lz}) Final yMax for assign = ${yMax}`);
+        
+        // If LOW LOD, yMax (e.g., 0-15) needs to be scaled to world-comparable height
+        // if other systems expect heightmap values to be in a consistent range.
+        // For now, store the yMax relative to the chunk's data height.
+        // If CHUNK_SIZE.HEIGHT is 128 and currentChunkSize.HEIGHT is 16,
+        // then yMax should be scaled by 128/16 = 8 if storing world-scale height.
+        // However, the original code stored local yMax, so let's stick to that for now for direct replacement.
+        // The heightFn on server produces world-scale heights. Client heightmap was storing local y.
+        // This part is tricky: what should heightmap values represent?
+        // Let's assume for now yMax should be scaled to reflect a value comparable to a HIGH LOD chunk's y range.
+        let finalHeightForMap = yMax;
+        if (this.lodLevel === LODLevel.LOW) {
+             // Scale yMax from LOW_LOD chunk.data height range to CHUNK_SIZE.HEIGHT range
+             finalHeightForMap = Math.floor(yMax * (CHUNK_SIZE.HEIGHT / currentChunkSize.HEIGHT));
         }
-        // DEBUG LOGGING END
-        const heightmapIndex = lz * CHUNK_SIZE.WIDTH + lx; // Corrected indexing: lz first, then lx
-        this.heightmap[heightmapIndex] = yMax;
+
+
+        const heightmapIndex = hz * targetHeightmapWidth + hx;
+        this.heightmap[heightmapIndex] = finalHeightForMap;
       }
     }
-    // console.log(`[Chunk ${this.x},${this.z}] Regenerated heightmap. Sample H[0,0]=${this.heightmap[0]}`);
   }
 } 

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { Chunk, LODLevel, CHUNK_SIZE } from './Chunk';
+import { Chunk } from './Chunk';
+import { LODLevel, CHUNK_SIZE, LOD_CHUNK_SIZE } from '../shared/constants.js';
 import { NoiseManager } from './NoiseManager';
 import { MesherManager } from './MesherManager';
 
@@ -19,6 +20,7 @@ interface UnsentChunkRequest { // Added interface for queued requests
   resolve: (chunk: Chunk) => void;
   reject: (reason?: any) => void;
   key: string;
+  seq: number; // Added seq for tracking
 }
 
 export class ChunkManager {
@@ -38,25 +40,26 @@ export class ChunkManager {
   private lastPlayerPosition: { x: number, z: number } | null = null;
   private positionChangeThreshold: number = 4;
   private lastUpdateTime: number = 0;
-  private updateInterval: number = 200;
-  private maxChunksPerFrame: number = 8;
-  private batchSize: number = 2;
+  private updateInterval: number = 100;
+  private maxChunksPerFrame: number = 16;
+  private batchSize: number = 4;
   private chunkHeightmaps: Map<string, Uint8Array> = new Map();
   private chunkData: Map<string, Chunk> = new Map();
   private loggedMissingHeightmaps: Set<string> = new Set();
   private loggedSocketNotReadyForChunks: Set<string> = new Set();
 
   // For handling pending chunk requests from the server
-  private pendingChunkRequests: Map<string, { resolve: (chunk: Chunk) => void, reject: (reason?: any) => void }> = new Map();
+  private pendingChunkRequests: Map<string, { resolve: (chunk: Chunk) => void, reject: (reason?: any) => void, seq: number, lodLevel: LODLevel }> = new Map(); // NEW: LOD-specific key, added lodLevel to value for clarity/safety
   private unsentChunkRequestsQueue: UnsentChunkRequest[] = []; // Added queue for unsent requests
+  private chunkRequestSeq = 0; // Added for sequencing chunk requests
 
   constructor(
     noiseManager: NoiseManager,
     mesherManager: MesherManager,
     scene: THREE.Scene,
     socket: WebSocket | null, // Allow null for local fallback or testing
-    renderDistance: number = 3,
-    maxLoadedChunks: number = 100,
+    renderDistance: number = 10,
+    maxLoadedChunks: number = 450,
     unloadDistanceChunks?: number
   ) {
     this.noiseManager = noiseManager;
@@ -64,7 +67,7 @@ export class ChunkManager {
     this.scene = scene;
     this.socket = socket; // Store the WebSocket instance
     this.renderDistance = renderDistance;
-    this.unloadDistanceChunks = unloadDistanceChunks !== undefined ? unloadDistanceChunks : renderDistance + 2;
+    this.unloadDistanceChunks = unloadDistanceChunks !== undefined ? unloadDistanceChunks : renderDistance + 5; // Default buffer of 5
     this.maxLoadedChunks = maxLoadedChunks;
 
     // Load the texture
@@ -90,6 +93,10 @@ export class ChunkManager {
     return `${chunkX},${chunkZ}`;
   }
 
+  private getChunkLODKey(chunkX: number, chunkZ: number, lodLevel: LODLevel): string {
+    return `${chunkX},${chunkZ},L${lodLevel}`;
+  }
+
   private getDistanceToChunk(playerX: number, playerZ: number, chunkX: number, chunkZ: number): number {
     const playerChunkX = Math.floor(playerX / 32);
     const playerChunkZ = Math.floor(playerZ / 32);
@@ -100,9 +107,9 @@ export class ChunkManager {
 
   private getLODLevelForDistance(distance: number, chunkKey: string): LODLevel {
     const lastLOD = this.lastLODLevels.get(chunkKey);
-    // const baseLOD = distance > this.lodTransitionDistance ? LODLevel.LOW : LODLevel.HIGH; 
+    const baseLOD = distance > this.lodTransitionDistance ? LODLevel.LOW : LODLevel.HIGH;
     // For now, let's simplify and always request HIGH LOD from server, server can decide if it sends different LODs later
-    const baseLOD = LODLevel.HIGH;
+    // const baseLOD = LODLevel.HIGH; // REMOVED: Forced HIGH LOD
     
     // Apply hysteresis to prevent LOD flickering
     if (lastLOD !== undefined) {
@@ -137,98 +144,74 @@ export class ChunkManager {
 
   private async loadChunk(chunkX: number, chunkZ: number, scene: THREE.Scene, lodLevel: LODLevel): Promise<void> {
     const key = this.getChunkKey(chunkX, chunkZ);
-    // if (this.loadedChunks.has(key) || this.loadingChunks.has(key)) return; // Original check
-    // Ensure that if a chunk is loaded, its LOD is appropriate, or reload if not.
+    const lodKey = this.getChunkLODKey(chunkX, chunkZ, lodLevel);
+
     const existingChunk = this.loadedChunks.get(key);
     if (existingChunk) {
         if (existingChunk.lodLevel === lodLevel) {
-            existingChunk.lastAccessed = Date.now(); // Update access time
-            return; // Already loaded with correct LOD
+            existingChunk.lastAccessed = Date.now();
+            return;
         } else {
-            // console.log(`[Client ChunkManager] Chunk ${key} exists with LOD ${existingChunk.lodLevel}, requested ${lodLevel}. Reloading.`);
-            // Different LOD requested, unload current and reload.
-            await this.unloadChunk(key, scene); 
-            // Proceed to load with new LOD below.
+            await this.unloadChunk(key, scene);
         }
     }
-    if (this.loadingChunks.has(key)) { // Still loading, perhaps for a different LOD.
-        // This logic might need to be more sophisticated if multiple LOD requests for the same chunk can interleave.
-        // For now, if it's in loadingChunks, assume the current load process will handle it or be superseded.
-        // console.warn(`[Client ChunkManager] Chunk ${key} is already in loadingChunks set. Skipping new load attempt for LOD ${lodLevel}.`);
+
+    if (this.loadingChunks.has(lodKey)) {
         return;
     }
 
-    this.loadingChunks.add(key);
-    this.lastLODLevels.set(key, lodLevel); // Store the target LOD
+    this.loadingChunks.add(lodKey);
+    this.lastLODLevels.set(key, lodLevel);
     if (import.meta.env.DEV) {
-      // console.debug(`Loading chunk at ${chunkX}, ${chunkZ} with LOD ${lodLevel}`);
-      console.log(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Attempting to load chunk.`);
+      console.log(`[CM LoadChunk Debug] Chunk ${lodKey}: Attempting to load chunk.`);
     }
 
     try {
-      // Generate chunk data - NOW REQUESTS FROM SERVER OR FALLS BACK
-      // const chunk = await this.noiseManager.generateChunk(chunkX, chunkZ, lodLevel); // OLD WAY
-      console.log(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Calling requestChunkDataFromServer.`);
-      const chunk = await this.requestChunkDataFromServer(chunkX, chunkZ, lodLevel); // NEW WAY
+      console.log(`[CM LoadChunk Debug] Chunk ${lodKey}: Calling requestChunkDataFromServer.`);
+      const chunk = await this.requestChunkDataFromServer(chunkX, chunkZ, lodLevel);
       
       if (!chunk) {
-        // console.error(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Failed to obtain valid chunk object from requestChunkDataFromServer. Cannot proceed.`); // Temporarily comment out
-        this.loadingChunks.delete(key); // Clean up loading state
+        this.loadingChunks.delete(lodKey);
         return;
       }
-      const chunkVoxelData = chunk.getData(); // Use getData() to access voxel data for logging
+      const chunkVoxelData = chunk.getData();
       if (!chunkVoxelData || chunkVoxelData.length === 0) {
-        // console.error(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Obtained chunk object, but its voxel data is null or empty. Cannot proceed.`); // Temporarily comment out
-        this.loadingChunks.delete(key);
+        this.loadingChunks.delete(lodKey);
         return;
       }
 
-      console.log(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Chunk data obtained. Voxel length: ${chunkVoxelData.length}.`);
-
-      // Store chunk data (might be redundant if requestChunkDataFromServer's resolution path already does this, but good for clarity)
+      console.log(`[CM LoadChunk Debug] Chunk ${lodKey}: Chunk data obtained. Voxel length: ${chunkVoxelData.length}.`);
       this.chunkData.set(key, chunk);
 
-      // Store heightmap (Chunk class should have a method to get/generate this from its data)
       const heightmap = chunk.getHeightmap();
       if (!heightmap || heightmap.length !== CHUNK_SIZE.WIDTH * CHUNK_SIZE.DEPTH) {
-        // console.warn(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Invalid or missing heightmap after chunk data obtained. Length: ${heightmap?.length}. Expected: ${CHUNK_SIZE.WIDTH * CHUNK_SIZE.DEPTH}. Regenerated heightmap in Chunk.setData should have fixed this.`); // Temporarily comment out
       } else {
         this.chunkHeightmaps.set(key, heightmap);
-        this.loggedMissingHeightmaps.delete(key); // Clear log warning flag
-        const heightmapSample = Array.from(heightmap.slice(0, 5)); // Smaller sample
-        // console.log(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Stored valid heightmap. Sample H[0..4]: ${heightmapSample.join(',')}`); // Temporarily comment out
+        this.loggedMissingHeightmaps.delete(key);
       }
       
-
-      // Generate mesh
-      console.log(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Attempting to mesh chunk.`);
+      console.log(`[CM LoadChunk Debug] Chunk ${lodKey}: Attempting to mesh chunk.`);
       const meshData = await this.mesherManager.meshChunk(chunk);
-      console.log(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Meshing complete. Positions: ${meshData?.positions?.length}, Indices: ${meshData?.indices?.length}`);
+      console.log(`[CM LoadChunk Debug] Chunk ${lodKey}: Meshing complete. Positions: ${meshData?.positions?.length}, Indices: ${meshData?.indices?.length}`);
 
       if (!meshData || meshData.positions.length === 0 || meshData.indices.length === 0) {
-        // console.warn(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Meshing produced no geometry. Skipping mesh creation.`); // Temporarily comment out
-        // this.loadingChunks.delete(key); // Already in finally
         return; 
       }
 
-      // Create Three.js geometry
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.BufferAttribute(meshData.positions, 3));
       geometry.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
       geometry.setAttribute('uv', new THREE.BufferAttribute(meshData.uvs, 2));
       geometry.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
 
-      // Create mesh
       const chunkMesh = new THREE.Mesh(geometry, this.chunkMaterial);
       chunkMesh.position.set(chunkX * 32, 0, chunkZ * 32);
       chunkMesh.castShadow = true;
       chunkMesh.receiveShadow = true;
 
-      // Add to scene
       scene.add(chunkMesh);
-      console.log(`[CM LoadChunk Debug] Chunk ${key} LOD ${lodLevel}: Mesh ADDED to scene successfully.`);
+      console.log(`[CM LoadChunk Debug] Chunk ${lodKey}: Mesh ADDED to scene successfully.`);
 
-      // Store chunk
       this.loadedChunks.set(key, {
         mesh: chunkMesh,
         lastAccessed: Date.now(),
@@ -240,37 +223,84 @@ export class ChunkManager {
         console.log(`[Client ChunkManager] Mesh for ${key} ADDED to scene.`);
       }
     } catch (error) {
-      // console.error(`[CM LoadChunk Debug] Error loading chunk ${key} (LOD ${lodLevel}):`, error); // Temporarily comment out
     } finally {
-      this.loadingChunks.delete(key);
+      this.loadingChunks.delete(lodKey);
     }
   }
 
   private async unloadChunk(key: string, scene: THREE.Scene): Promise<void> {
-    const chunkData = this.loadedChunks.get(key);
-    if (chunkData) {
+    const chunkMeshDetails = this.loadedChunks.get(key);
+    if (chunkMeshDetails) {
       // Remove from scene first
-      if (chunkData.mesh.parent) {
-        scene.remove(chunkData.mesh);
+      if (chunkMeshDetails.mesh.parent) {
+        scene.remove(chunkMeshDetails.mesh);
       }
       
       // Dispose of geometry and material
-      chunkData.mesh.geometry.dispose();
-      // Material is shared, so we don't dispose it here unless it becomes unique
-      // if (Array.isArray(chunkData.mesh.material)) {
-      //   chunkData.mesh.material.forEach(material => material.dispose());
-      // } else {
-      //   chunkData.mesh.material.dispose();
-      // }
-      
-      // Remove from internal data structures
+      chunkMeshDetails.mesh.geometry.dispose();
       this.loadedChunks.delete(key);
-      this.lastLODLevels.delete(key);
-      this.chunkHeightmaps.delete(key);
-      this.chunkData.delete(key);
-      if (import.meta.env.DEV) {
-        console.debug(`Unloaded chunk ${key}`);
+    }
+    
+    // Remove from other internal data structures that use the simple key
+    this.lastLODLevels.delete(key);
+    this.chunkHeightmaps.delete(key);
+    this.chunkData.delete(key);
+
+    // New: Cancel pending and unsent requests for this chunk coordinate (any LOD)
+    // and clear from loadingChunks.
+    const [cxStr, czStr] = key.split(',');
+    if (cxStr === undefined || czStr === undefined) {
+        console.error(`[CM UnloadChunk] Invalid simple key format: ${key}`);
+        return;
+    }
+    const cx = parseInt(cxStr, 10);
+    const cz = parseInt(czStr, 10);
+
+    if (isNaN(cx) || isNaN(cz)) {
+        console.error(`[CM UnloadChunk] Could not parse chunk coordinates from key: ${key}`);
+        return;
+    }
+
+    const lodsToProcess = [LODLevel.HIGH, LODLevel.LOW]; // Iterate over all possible LODs
+
+    for (const lod of lodsToProcess) {
+      const lodKeyToCancel = this.getChunkLODKey(cx, cz, lod);
+
+      // Cancel from pendingChunkRequests
+      const pending = this.pendingChunkRequests.get(lodKeyToCancel);
+      if (pending) {
+        pending.reject(new Error(`Chunk ${lodKeyToCancel} unloaded while request was pending.`));
+        this.pendingChunkRequests.delete(lodKeyToCancel);
+        if (import.meta.env.DEV) {
+            console.debug(`[CM UnloadChunk] Cancelled pending server request for ${lodKeyToCancel}.`);
+        }
       }
+
+      // Remove from loadingChunks
+      if (this.loadingChunks.has(lodKeyToCancel)) {
+        this.loadingChunks.delete(lodKeyToCancel);
+        if (import.meta.env.DEV) {
+            console.debug(`[CM UnloadChunk] Removed ${lodKeyToCancel} from loadingChunks set.`);
+        }
+      }
+    }
+    
+    // Filter out from unsentChunkRequestsQueue
+    const initialUnsentQueueSize = this.unsentChunkRequestsQueue.length;
+    this.unsentChunkRequestsQueue = this.unsentChunkRequestsQueue.filter(req => {
+        const shouldKeep = !(req.chunkX === cx && req.chunkZ === cz);
+        if (!shouldKeep && import.meta.env.DEV) {
+            const unsentLodKey = this.getChunkLODKey(req.chunkX, req.chunkZ, req.lodLevel);
+            console.debug(`[CM UnloadChunk] Removing ${unsentLodKey} (seq ${req.seq}) from unsentChunkRequestsQueue.`);
+        }
+        return shouldKeep;
+    });
+    if (import.meta.env.DEV && this.unsentChunkRequestsQueue.length < initialUnsentQueueSize) {
+        console.debug(`[CM UnloadChunk] Unsent queue size changed from ${initialUnsentQueueSize} to ${this.unsentChunkRequestsQueue.length} after unloading ${key}.`);
+    }
+
+    if (import.meta.env.DEV) {
+      console.debug(`Unloaded chunk ${key} and attempted to cancel related pending/unsent requests.`);
     }
   }
 
@@ -319,28 +349,63 @@ export class ChunkManager {
     const dz = playerZ - this.lastPlayerPosition.z;
     const distanceMoved = Math.sqrt(dx * dx + dz * dz);
 
-    // Update if we've moved more than 1 chunk (32 units)
-    if (distanceMoved >= 32) {
+    // Check if player moved significantly OR if render distance changed recently
+    // (this.lastUpdateTime = 0 is set in setRenderDistance)
+    // A more direct way to check for forced update might be a flag, but this works.
+    let forceUpdateDueToSettingsChange = false;
+    // If lastUpdateTime was reset to 0 (e.g., by setRenderDistance), 
+    // it implies a settings change that should force re-evaluation of chunks.
+    // Note: This check is a bit indirect. The update method already uses lastUpdateTime
+    // to bypass the interval. Here we just want to know if we should proceed past movement check.
+    // The main update loop will handle the interval itself.
+    // The primary goal is ensuring that if render distance changes, we DO re-evaluate chunks.
+    // The fact that setRenderDistance sets lastUpdateTime to 0, and the main update loop
+    // *will* run because of that, means this specific check for forceUpdateDueToSettingsChange
+    // might be redundant if the loop below is correct. The key is the loop's correctness.
+
+    if (distanceMoved >= CHUNK_SIZE.WIDTH) { // Use CHUNK_SIZE.WIDTH for clarity (e.g. 32)
       this.lastPlayerPosition = { x: playerX, z: playerZ };
-      return true;
+      return true; // Player moved significantly, defintely update.
     }
 
-    // Also update if we have any chunks that need loading
-    const playerChunkX = Math.floor(playerX / 32);
-    const playerChunkZ = Math.floor(playerZ / 32);
+    // If player hasn't moved significantly, check if any chunks need loading/LOD change.
+    // This is crucial for when render distance changes while player is stationary.
+    const playerChunkX = Math.floor(playerX / CHUNK_SIZE.WIDTH);
+    const playerChunkZ = Math.floor(playerZ / CHUNK_SIZE.DEPTH);
     
     for (let x = -this.renderDistance; x <= this.renderDistance; x++) {
       for (let z = -this.renderDistance; z <= this.renderDistance; z++) {
         const chunkX = playerChunkX + x;
         const chunkZ = playerChunkZ + z;
-        const key = this.getChunkKey(chunkX, chunkZ);
-        if (!this.loadedChunks.has(key) && !this.loadingChunks.has(key)) {
-          return true;
+        const simpleKey = this.getChunkKey(chunkX, chunkZ);
+        
+        const distance = this.getDistanceToChunk(playerX, playerZ, chunkX, chunkZ);
+        const desiredLOD = this.getLODLevelForDistance(distance, simpleKey);
+        const lodKeyForDesired = this.getChunkLODKey(chunkX, chunkZ, desiredLOD);
+
+        const currentMeshDetails = this.loadedChunks.get(simpleKey);
+        
+        // Condition 1: Is the chunk not loaded at all?
+        if (!currentMeshDetails) {
+          // If not loaded, is it also not currently loading at the desired LOD?
+          if (!this.loadingChunks.has(lodKeyForDesired)) {
+            // console.log(`[ShouldUpdateChunks] Reason: Chunk ${simpleKey} not loaded, and desired LOD ${LODLevel[desiredLOD]} not loading. RETURNING TRUE`);
+            return true; // Needs loading
+          }
+        } else {
+          // Condition 2: Chunk is loaded, but is it at the wrong LOD?
+          if (currentMeshDetails.lodLevel !== desiredLOD) {
+            // If wrong LOD, is the desired LOD also not currently loading?
+            if (!this.loadingChunks.has(lodKeyForDesired)) {
+              // console.log(`[ShouldUpdateChunks] Reason: Chunk ${simpleKey} loaded at LOD ${LODLevel[currentMeshDetails.lodLevel]}, but desires ${LODLevel[desiredLOD]}, and desired not loading. RETURNING TRUE`);
+              return true; // Needs LOD change and desired LOD isn't loading
+            }
+          }
         }
       }
     }
-
-    return false;
+    // console.log("[ShouldUpdateChunks] No significant movement and all desired chunks appear to be loaded or loading at correct LOD. RETURNING FALSE");
+    return false; // No significant movement AND all desired chunks are loaded at correct LOD or are loading.
   }
 
   private getVisibleChunks(
@@ -420,14 +485,12 @@ export class ChunkManager {
         const key = this.getChunkKey(chunkX, chunkZ);
         const distance = this.getDistanceToChunk(playerX, playerZ, chunkX, chunkZ);
         
-        if (distance <= this.renderDistance) {
-          const lodLevel = this.getLODLevelForDistance(distance, key);
-          desiredChunksInRenderDistance.set(key, lodLevel);
-          this.lastLODLevels.set(key, lodLevel);
+        const lodLevel = this.getLODLevelForDistance(distance, key);
+        desiredChunksInRenderDistance.set(key, lodLevel);
+        this.lastLODLevels.set(key, lodLevel);
 
-          const priority = this.getChunkPriority(playerX, playerZ, chunkX, chunkZ);
-          chunkPriorities.push({ key, priority });
-        }
+        const priority = this.getChunkPriority(playerX, playerZ, chunkX, chunkZ);
+        chunkPriorities.push({ key, priority });
       }
     }
     chunkPriorities.sort((a, b) => b.priority - a.priority);
@@ -468,20 +531,37 @@ export class ChunkManager {
     for (let i = 0; i < chunkPriorities.length && chunksLoadedThisFrame < this.maxChunksPerFrame; i += this.batchSize) {
       const batch = chunkPriorities.slice(i, i + this.batchSize);
       const batchPromises = batch.map(({ key }) => {
-        // Ensure we only attempt to load chunks that are desired (within renderDistance)
         if (desiredChunksInRenderDistance.has(key)) {
-            // Prevent loading more if we'd exceed maxLoadedChunks, considering current + loading count
-            // This check helps prevent over-queueing if generation is slow or maxChunksPerFrame is high
+            // Max loaded chunks check (approximate due to loadingChunks being LOD-specific)
+            // Prevents initiating load for a NEW chunk if already at/near capacity.
             if ((this.loadedChunks.size + this.loadingChunks.size) >= this.maxLoadedChunks && !this.loadedChunks.has(key)) {
                 return Promise.resolve();
             }
 
-            if (!this.loadedChunks.has(key) && !this.loadingChunks.has(key)) {
-                const [x, z] = key.split(',').map(Number);
-                const lodLevel = desiredChunksInRenderDistance.get(key)!;
-                chunksLoadedThisFrame++;
-                return this.loadChunk(x, z, scene, lodLevel);
+            const [x, z] = key.split(',').map(Number);
+            const desiredLOD = desiredChunksInRenderDistance.get(key)!;
+            const lodKeyForDesired = this.getChunkLODKey(x, z, desiredLOD);
+
+            const currentMeshDetails = this.loadedChunks.get(key); // Mesh details by simple key
+
+            // Condition 1: Is the SPECIFIC desired LOD already being loaded?
+            if (this.loadingChunks.has(lodKeyForDesired)) {
+                return Promise.resolve(); // Yes, so skip.
             }
+
+            // Condition 2: Is there a mesh, and is it ALREADY the desired LOD?
+            if (currentMeshDetails && currentMeshDetails.lodLevel === desiredLOD) {
+                // lastAccessed already updated in a prior loop
+                return Promise.resolve(); // Yes, so skip.
+            }
+            
+            // If we are here, then either:
+            // a) No mesh exists for (cx,cz)
+            // b) A mesh exists, but it's for a DIFFERENT LOD.
+            // AND in both cases, the DESIRED LOD is not currently in loadingChunks.
+            // So, we should proceed to call loadChunk.
+            chunksLoadedThisFrame++;
+            return this.loadChunk(x, z, scene, desiredLOD);
         }
         return Promise.resolve();
       });
@@ -489,9 +569,9 @@ export class ChunkManager {
       loadPromises.push(...batchPromises);
       
       // Reduce delay between batches significantly to improve responsiveness
-      if (i + this.batchSize < chunkPriorities.length && batchPromises.some(p => p !== Promise.resolve())) { // Only delay if actual loading was initiated
+      /* if (i + this.batchSize < chunkPriorities.length && batchPromises.some(p => p !== Promise.resolve())) { // Only delay if actual loading was initiated
         await new Promise(resolve => setTimeout(resolve, 10)); // Reduced from 50ms to 10ms
-      }
+      } */
     }
     await Promise.all(loadPromises);
   }
@@ -895,23 +975,52 @@ export class ChunkManager {
     this.processUnsentChunkRequests(); // Process any queued requests
   }
 
-  public handleChunkResponse(cx: number, cz: number, voxels: number[] /*, lodLevel: LODLevel - if server sends it */) {
-    const key = this.getChunkKey(cx, cz);
-    const pendingRequest = this.pendingChunkRequests.get(key);
+  public handleChunkResponse(cx: number, cz: number, voxels: number[], lod: number | undefined, seq: number | undefined /*, lodLevel: LODLevel - if server sends it */) {
+    // const key = this.getChunkKey(cx, cz); // OLD
+    // Determine the LODLevel to use. Default to HIGH if undefined or not 0/1.
+    const receivedLOD: LODLevel = (lod === LODLevel.LOW || lod === 1) ? LODLevel.LOW : LODLevel.HIGH;
+    const lodKey = this.getChunkLODKey(cx, cz, receivedLOD); // NEW: Use LOD-specific key
 
-    console.log(`[CM HandleResp Debug] For ${key}. Voxels received: ${voxels?.length}. PendingReq: ${!!pendingRequest}`);
+    // console.log(`[CM HandleResp Debug] For ${key}. Voxels: ${voxels?.length}. PendingReq: ${!!pendingRequest}. ServerLOD: ${lod}, ParsedLOD: ${LODLevel[receivedLOD]}, ServerSeq: ${seq}`); // OLD KEY
+    console.log(`[CM HandleResp Debug] For ${lodKey}. Voxels: ${voxels?.length}. ServerLOD: ${lod}, ParsedLOD: ${LODLevel[receivedLOD]}, ServerSeq: ${seq}`);
+
+
+    const pendingRequest = this.pendingChunkRequests.get(lodKey); // NEW: Use LOD-specific key
+
+    // console.log(`[CM HandleResp Debug] For ${key}. Voxels: ${voxels?.length}. PendingReq: ${!!pendingRequest}. ServerLOD: ${lod}, ParsedLOD: ${LODLevel[receivedLOD]}, ServerSeq: ${seq}`); // ALREADY UPDATED ABOVE
 
     if (pendingRequest) {
+      // Optional: Check if pendingRequest.seq matches received seq if strict matching is needed.
+      // For now, key match is primary.
+      if (pendingRequest.seq !== seq && seq !== undefined) {
+        // console.warn(`[CM HandleResp SeqMismatch] For ${key}. Expected seq: ${pendingRequest.seq}, got: ${seq}. Proceeding as key matches.`); // OLD KEY
+        console.warn(`[CM HandleResp SeqMismatch] For ${lodKey}. Expected seq: ${pendingRequest.seq}, got: ${seq}. Proceeding as key matches.`);
+      }
+      // Check if the received LOD matches the LOD of the pending request.
+      // This is an important sanity check, though the key itself should ensure this.
+      if (pendingRequest.lodLevel !== receivedLOD) {
+          console.error(`[CM HandleResp LODMismatch] For ${lodKey}. Expected LOD ${LODLevel[pendingRequest.lodLevel]}, got LOD ${LODLevel[receivedLOD]}. This should not happen if keys are correct. Rejecting.`);
+          pendingRequest.reject(`LOD mismatch for ${lodKey}`);
+          this.pendingChunkRequests.delete(lodKey); // NEW: Use LOD-specific key
+          return;
+      }
+
+
       if (!voxels || voxels.length === 0) {
-        console.error(`[CM HandleResp Debug] Chunk ${key}: Received empty or invalid voxel data from server.`);
-        pendingRequest.reject(`Empty or invalid voxel data for ${key}`);
-        this.pendingChunkRequests.delete(key);
+        // console.error(`[CM HandleResp Debug] Chunk ${key}: Received empty or invalid voxel data from server.`); // OLD KEY
+        console.error(`[CM HandleResp Debug] Chunk ${lodKey}: Received empty or invalid voxel data from server.`);
+        // pendingRequest.reject(`Empty or invalid voxel data for ${key}`); // OLD KEY
+        pendingRequest.reject(`Empty or invalid voxel data for ${lodKey}`);
+        // this.pendingChunkRequests.delete(key); // OLD
+        this.pendingChunkRequests.delete(lodKey); // NEW: Use LOD-specific key
         return;
       }
-      const chunk = new Chunk(cx, cz, LODLevel.HIGH); 
+      // MODIFIED: Use receivedLOD when creating the chunk
+      const chunk = new Chunk(cx, cz, receivedLOD); 
       try {
         chunk.setData(new Uint8Array(voxels)); 
-        console.log(`[CM HandleResp Debug] Chunk ${key}: setData called. Heightmap regen by Chunk.ts. Sample H[0]: ${chunk.getHeightmap()[0]}`);
+        // console.log(`[CM HandleResp Debug] Chunk ${key} (LOD: ${LODLevel[chunk.lodLevel]}): setData called. Voxel length provided: ${voxels.length}, Chunk internal data length: ${chunk.getData().length}. Sample H[0]: ${chunk.getHeightmap()[0]}`); // OLD KEY
+        console.log(`[CM HandleResp Debug] Chunk ${lodKey} (LOD: ${LODLevel[chunk.lodLevel]}): setData called. Voxel length provided: ${voxels.length}, Chunk internal data length: ${chunk.getData().length}. Sample H[0]: ${chunk.getHeightmap()[0]}`);
 
         // DEBUG LOGGING FOR CHUNK -1,-1, localX=31, localZ=21
         if (import.meta.env.DEV && cx === -1 && cz === -1) {
@@ -932,87 +1041,161 @@ export class ChunkManager {
         
         pendingRequest.resolve(chunk);
       } catch (e) {
-        console.error(`[CM HandleResp Debug] Chunk ${key}: Error during chunk.setData or heightmap generation:`, e);
-        pendingRequest.reject(`Error processing voxel data for ${key}: ${e}`);
+        // console.error(`[CM HandleResp Debug] Chunk ${key}: Error during chunk.setData or heightmap generation:`, e); // OLD KEY
+        console.error(`[CM HandleResp Debug] Chunk ${lodKey}: Error during chunk.setData or heightmap generation:`, e);
+        // pendingRequest.reject(`Error processing voxel data for ${key}: ${e}`); // OLD KEY
+        pendingRequest.reject(`Error processing voxel data for ${lodKey}: ${e}`);
       }
-      this.pendingChunkRequests.delete(key);
+      // this.pendingChunkRequests.delete(key); // OLD
+      this.pendingChunkRequests.delete(lodKey); // NEW: Use LOD-specific key
     } else {
-      console.warn(`[CM HandleResp Debug] Received chunkResponse for ${key}, but no pending request found.`);
+      // console.warn(`[CM HandleResp Debug] Received chunkResponse for ${key}, but no pending request found.`); // OLD KEY
+      console.warn(`[CM HandleResp Debug] Received chunkResponse for ${lodKey}, but no pending request found.`);
     }
   }
 
-  public handleChunkResponseError(cx: number, cz: number, reason: string) {
-    const key = this.getChunkKey(cx, cz);
-    console.error(`[CM HandleRespError Debug] For ${key}. Reason: ${reason}`);
-    const pendingRequest = this.pendingChunkRequests.get(key);
-    if (pendingRequest) {
-        console.error(`[Client ChunkManager] Server error for chunk ${key}: ${reason}`);
-        pendingRequest.reject(new Error(`Server error for chunk ${key}: ${reason}`));
-        this.pendingChunkRequests.delete(key);
+  public handleChunkResponseError(cx: number, cz: number, seq: number | undefined, reason: string) {
+    // const key = this.getChunkKey(cx, cz); // OLD
+    // Attempt to find the request. Since we don't know the original LOD for the error,
+    // we might have to iterate or make an assumption.
+    // For now, let's assume errors are rare and a simple log is fine.
+    // A more robust solution would require the server to echo back the requested LOD in error messages too.
+    // OR, iterate through pending requests for matching cx,cz,seq.
+
+    // Let's try to find it by iterating if seq is present.
+    let foundKey: string | undefined = undefined;
+    let originalLodOfFailedRequest: LODLevel | undefined = undefined;
+
+    if (seq !== undefined) {
+        for (const [pKey, pReq] of this.pendingChunkRequests.entries()) {
+            if (pReq.seq === seq) { // Assuming cx,cz from params are correct for this seq
+                const parts = pKey.split(',');
+                const reqCx = parseInt(parts[0], 10);
+                const reqCz = parseInt(parts[1], 10);
+                if (reqCx === cx && reqCz === cz) {
+                    foundKey = pKey;
+                    originalLodOfFailedRequest = pReq.lodLevel;
+                    break;
+                }
+            }
+        }
+    }
+
+    const errorKeyForLog = foundKey ? foundKey : `cx:${cx},cz:${cz},lod:unknown`;
+    console.error(`[CM HandleRespError Debug] For ${errorKeyForLog}. Seq: ${seq}, Reason: ${reason}`);
+
+    if (foundKey) {
+        const pendingRequest = this.pendingChunkRequests.get(foundKey);
+        if (pendingRequest) { // Should always be true if foundKey is set
+            console.error(`[Client ChunkManager] Server error for chunk ${foundKey} (reqSeq: ${pendingRequest.seq}, reqLOD: ${LODLevel[pendingRequest.lodLevel]}): ${reason}`);
+            pendingRequest.reject(new Error(`Server error for chunk ${foundKey}: ${reason}`));
+            this.pendingChunkRequests.delete(foundKey);
+        }
     } else {
-        console.warn(`[Client ChunkManager] Received chunkResponseError for ${key}, but no pending request found.`);
+         // If we couldn't find by seq, try to construct keys for both LODs if no seq given.
+         // This is a fallback and might clear the wrong request if seq is missing.
+         const highLodKey = this.getChunkLODKey(cx, cz, LODLevel.HIGH);
+         const lowLodKey = this.getChunkLODKey(cx, cz, LODLevel.LOW);
+         let rejected = false;
+
+         const pendingHigh = this.pendingChunkRequests.get(highLodKey);
+         if (pendingHigh && (seq === undefined || pendingHigh.seq === seq)) {
+            console.error(`[Client ChunkManager] Server error for chunk ${highLodKey} (reqSeq: ${pendingHigh.seq}): ${reason}. (Error had no seq or matched high LOD seq)`);
+            pendingHigh.reject(new Error(`Server error for chunk ${highLodKey}: ${reason}`));
+            this.pendingChunkRequests.delete(highLodKey);
+            rejected = true;
+         }
+         
+         const pendingLow = this.pendingChunkRequests.get(lowLodKey);
+         if (pendingLow && (seq === undefined || pendingLow.seq === seq)) {
+            console.error(`[Client ChunkManager] Server error for chunk ${lowLodKey} (reqSeq: ${pendingLow.seq}): ${reason}. (Error had no seq or matched low LOD seq)`);
+            pendingLow.reject(new Error(`Server error for chunk ${lowLodKey}: ${reason}`));
+            this.pendingChunkRequests.delete(lowLodKey);
+            rejected = true;
+         }
+
+        if (!rejected) {
+            console.warn(`[Client ChunkManager] Received chunkResponseError for ${cx},${cz} (seq ${seq}), but no matching pending request found (tried exact seq or general cx,cz).`);
+        }
     }
   }
 
   private sendChunkRequestOverSocket(
-    key: string,
+    // key: string, // OLD simple key
     chunkX: number,
     chunkZ: number,
     lodLevel: LODLevel,
+    requestSeq: number, // NEW: Pass assigned sequence number
     resolve: (chunk: Chunk) => void,
     reject: (reason?: any) => void
   ): void {
-    // If a request for this key is already in pendingChunkRequests, it means we've already sent a request to the server
-    // and are waiting for a response (handleChunkResponse or timeout).
-    // The current logic is that the LATEST call's resolve/reject overwrites the ones in pendingChunkRequests.
-    // This means the last call to loadChunk for a key will get its promise fulfilled.
-    if (this.pendingChunkRequests.has(key)) {
-        console.warn(`[CM SendToSocket Debug] Chunk ${key} LOD ${lodLevel}: Request already pending. Overwriting stored promise callbacks. Previous caller might not be resolved.`);
+    const lodKey = this.getChunkLODKey(chunkX, chunkZ, lodLevel); // NEW: Use LOD-specific key
+
+    // const requestSeq = this.chunkRequestSeq++; // OLD: Incremented here
+    if (this.pendingChunkRequests.has(lodKey)) {
+        const oldRequest = this.pendingChunkRequests.get(lodKey);
+        // console.warn(`[CM SendToSocket Debug] Chunk ${key} LOD ${lodLevel}: Request (seq ${requestSeq}) already pending (old seq ${oldRequest?.seq}). Overwriting stored promise callbacks. Previous caller might not be resolved.`); // OLD KEY
+        console.warn(`[CM SendToSocket Debug] Chunk ${lodKey}: Request (seq ${requestSeq}) already pending (old seq ${oldRequest?.seq}). This specific LOD request was already made. Overwriting promise callbacks. Previous caller for THIS LOD might not be resolved.`);
     }
-    this.pendingChunkRequests.set(key, { resolve, reject });
+    // this.pendingChunkRequests.set(key, { resolve, reject, seq: requestSeq }); // OLD
+    this.pendingChunkRequests.set(lodKey, { resolve, reject, seq: requestSeq, lodLevel: lodLevel }); // NEW: Use LOD-specific key & store lodLevel
 
     const requestMessage = {
       type: 'chunkRequest',
       cx: chunkX,
       cz: chunkZ,
-      lod: lodLevel 
+      lod: lodLevel,
+      seq: requestSeq // Include sequence number
     };
-    console.log(`[CM SendToSocket Debug] Chunk ${key} LOD ${lodLevel}: Sending to server:`, requestMessage);
+    // console.log(`[CM SendToSocket Debug] Chunk ${key} LOD ${lodLevel} Seq ${requestSeq}: Sending to server:`, requestMessage); // OLD KEY
+    console.log(`[CM SendToSocket Debug] Chunk ${lodKey} Seq ${requestSeq}: Sending to server:`, requestMessage);
     
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-        console.error(`[CM SendToSocket Debug] Chunk ${key} LOD ${lodLevel}: Socket is null or not open! Cannot send. This should have been caught by requestChunkDataFromServer and queued.`);
+        // console.error(`[CM SendToSocket Debug] Chunk ${key} LOD ${lodLevel}: Socket is null or not open! Cannot send. This should have been caught by requestChunkDataFromServer and queued.`); // OLD KEY
+        console.error(`[CM SendToSocket Debug] Chunk ${lodKey}: Socket is null or not open! Cannot send. This should have been caught by requestChunkDataFromServer and queued.`);
         // This specific call's promise will be rejected by its timeout logic if not caught earlier.
-        // Or, if it was added to pendingChunkRequests, it will wait for a response that will never come from this send.
-        // This indicates a logic flaw if we reach here.
-        // For now, the timeout below will handle rejecting this specific promise.
-        // The entry in pendingChunkRequests will also be cleared by that timeout.
     } else {
         this.socket.send(JSON.stringify(requestMessage));
     }
 
     const timeoutId = setTimeout(() => {
-      const currentPendingRequest = this.pendingChunkRequests.get(key);
-      if (currentPendingRequest && currentPendingRequest.resolve === resolve) {
+      // const currentPendingRequest = this.pendingChunkRequests.get(key); // OLD
+      const currentPendingRequest = this.pendingChunkRequests.get(lodKey); // NEW: Use LOD-specific key
+
+      // if (currentPendingRequest && currentPendingRequest.resolve === resolve && currentPendingRequest.seq === requestSeq) { // Check seq too // OLD comparison
+      if (currentPendingRequest && currentPendingRequest.seq === requestSeq) { // Simpler check: if seq matches, it's the right one for this timeout.
         // Changed from console.warn to console.debug
-        console.debug(`[CM SendToSocket Debug] TIMEOUT for ${key} (LOD ${lodLevel}) from server. Fallback to local gen was SKIPPED.`);
-        this.pendingChunkRequests.delete(key);
+        // console.debug(`[CM SendToSocket Debug] TIMEOUT for ${key} (LOD ${lodLevel}, Seq ${requestSeq}) from server. Fallback to local gen was SKIPPED.`); // OLD KEY
+        console.debug(`[CM SendToSocket Debug] TIMEOUT for ${lodKey} (Seq ${requestSeq}) from server. Fallback to local gen was SKIPPED.`);
+        // this.pendingChunkRequests.delete(key); // OLD
+        this.pendingChunkRequests.delete(lodKey); // NEW: Use LOD-specific key
         
         // DIAGNOSTIC: Temporarily disable fallback to local generation
         if (chunkX === -1 && chunkZ === -1) {
-            console.error(`[CM DIAGNOSTIC CRITICAL] TIMEOUT for chunk ${key} (LOD ${lodLevel}). Local generation SKIPPED. Chunk will be missing.`);
+            // console.error(`[CM DIAGNOSTIC CRITICAL] TIMEOUT for chunk ${key} (LOD ${lodLevel}). Local generation SKIPPED. Chunk will be missing.`); // OLD KEY
+            console.error(`[CM DIAGNOSTIC CRITICAL] TIMEOUT for chunk ${lodKey}. Local generation SKIPPED. Chunk will be missing.`);
         } else {
-            console.debug(`[CM DIAGNOSTIC] TIMEOUT for chunk ${key} (LOD ${lodLevel}). Local generation SKIPPED. Chunk will be missing.`);
+            // console.debug(`[CM DIAGNOSTIC] TIMEOUT for chunk ${key} (LOD ${lodLevel}). Local generation SKIPPED. Chunk will be missing.`); // OLD KEY
+            console.debug(`[CM DIAGNOSTIC] TIMEOUT for chunk ${lodKey}. Local generation SKIPPED. Chunk will be missing.`);
         }
 
         // Instead of generating, reject the promise or handle as missing chunk
         // For now, simply deleting the request and logging. The original promise will remain pending or timeout on its own.
-        currentPendingRequest.reject(new Error(`Server chunk ${key} timed out and local fallback is disabled.`));
+        // currentPendingRequest.reject(new Error(`Server chunk ${key} timed out and local fallback is disabled.`)); // OLD KEY
+        currentPendingRequest.reject(new Error(`Server chunk ${lodKey} timed out and local fallback is disabled.`));
 
       } else if (currentPendingRequest) {
-        console.log(`[CM SendToSocket Debug] Timeout for ${key} (LOD ${lodLevel}), but stored promise was for a newer request. Ignoring this timeout.`);
+        // Check if the stored request is actually the one that timed out by comparing sequence numbers
+        if (currentPendingRequest.seq === requestSeq) {
+          // console.log(`[CM SendToSocket Debug] Timeout for ${key} (LOD ${lodLevel}, Seq ${requestSeq}), but stored promise was for a newer request (or resolve changed). Ignoring this timeout logic branch based on resolve function comparison failure earlier.`);// OLD KEY
+          console.log(`[CM SendToSocket Debug] Timeout for ${lodKey} (Seq ${requestSeq}), but currentPendingRequest.seq matched but resolve function might have changed (should not happen if seq matches). This path indicates an issue or the request was already handled.`);
+        } else {
+          // console.log(`[CM SendToSocket Debug] Timeout for ${key} (LOD ${lodLevel}, Seq ${requestSeq}), but current pending request has different seq (${currentPendingRequest.seq}). Ignoring this specific timeout.`); // OLD KEY
+          console.log(`[CM SendToSocket Debug] Timeout for ${lodKey} (Seq ${requestSeq}), but current pending request has different seq (${currentPendingRequest.seq}). Ignoring this specific timeout.`);
+        }
       }
       // If !currentPendingRequest, it was already resolved/rejected.
-    }, 5000); // 5 sec timeout
+    }, 4000); // 4 sec timeout
   }
 
   private processUnsentChunkRequests(): void {
@@ -1026,41 +1209,49 @@ export class ChunkManager {
 
     for (const req of requestsToProcess) {
       if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-        console.log(`[Client ChunkManager] Processing queued request for ${req.key}`);
-        this.sendChunkRequestOverSocket(req.key, req.chunkX, req.chunkZ, req.lodLevel, req.resolve, req.reject);
+        // console.log(`[Client ChunkManager] Processing queued request for ${this.getChunkLODKey(req.chunkX, req.chunkZ, req.lodLevel)} (Unsent Seq ${req.seq})`);
+        // this.sendChunkRequestOverSocket(req.chunkX, req.chunkZ, req.lodLevel, req.resolve, req.reject); // OLD: sendChunkRequestOverSocket would assign its own seq
+        this.sendChunkRequestOverSocket(req.chunkX, req.chunkZ, req.lodLevel, req.seq, req.resolve, req.reject); // NEW: Pass the original seq from the UnsentChunkRequest
       } else {
-        console.warn(`[Client ChunkManager] Socket closed while processing queue. Re-queuing request for ${req.key}`);
+        // console.warn(`[Client ChunkManager] Socket closed while processing queue. Re-queuing request for ${this.getChunkLODKey(req.chunkX, req.chunkZ, req.lodLevel)} (Unsent Seq ${req.seq})`);
         this.unsentChunkRequestsQueue.push(req); // Add back to the main queue
       }
     }
   }
 
   private requestChunkDataFromServer(chunkX: number, chunkZ: number, lodLevel: LODLevel): Promise<Chunk> {
-    const key = this.getChunkKey(chunkX, chunkZ);
-    console.log(`[CM RequestData Debug] For ${key} LOD ${lodLevel}. Socket state: ${this.socket?.readyState}`);
+    // const key = this.getChunkKey(chunkX, chunkZ); // OLD simple key
+    const lodKey = this.getChunkLODKey(chunkX, chunkZ, lodLevel); // NEW LOD-specific key for logging & queue
+    // console.log(`[CM RequestData Debug] For ${key} LOD ${lodLevel}. Socket state: ${this.socket?.readyState}`); // OLD
+    console.log(`[CM RequestData Debug] For ${lodKey}. Socket state: ${this.socket?.readyState}`);
+
+    const requestSeq = this.chunkRequestSeq++; // Assign sequence number here, once per logical request
 
     return new Promise((resolve, reject) => {
       if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-        this.loggedSocketNotReadyForChunks.delete(key); // Socket is open, clear potential prior log for this chunk
-        console.log(`[CM RequestData Debug] Chunk ${key} LOD ${lodLevel}: Socket open, sending request to server via sendChunkRequestOverSocket.`);
-        this.sendChunkRequestOverSocket(key, chunkX, chunkZ, lodLevel, resolve, reject);
+        // this.loggedSocketNotReadyForChunks.delete(key); // OLD
+        this.loggedSocketNotReadyForChunks.delete(lodKey); // NEW: Use LOD-specific key
+        // console.log(`[CM RequestData Debug] Chunk ${key} LOD ${lodLevel}: Socket open, sending request to server via sendChunkRequestOverSocket.`); // DLOG-CM // OLD
+        // this.sendChunkRequestOverSocket(chunkX, chunkZ, lodLevel, resolve, reject); // OLD: sendChunkRequestOverSocket would assign its own seq
+        this.sendChunkRequestOverSocket(chunkX, chunkZ, lodLevel, requestSeq, resolve, reject); // NEW: Pass assigned requestSeq
       } else {
-        // Socket not ready. Check if it's already in the unsent queue to avoid duplicates.
-        if (import.meta.env.DEV && !this.loggedSocketNotReadyForChunks.has(key)) {
-            console.log(`[CM RequestData Debug] Chunk ${key} LOD ${lodLevel}: Socket not ready, adding to unsent queue. Logging once per chunk until socket is ready.`);
-            this.loggedSocketNotReadyForChunks.add(key);
+        // Socket not ready.
+        // if (import.meta.env.DEV && !this.loggedSocketNotReadyForChunks.has(key)) { // OLD
+        if (import.meta.env.DEV && !this.loggedSocketNotReadyForChunks.has(lodKey)) { // NEW: Use LOD-specific key
+            console.log(`[CM RequestData Debug] Chunk ${lodKey}: Socket not ready, adding to unsent queue. Logging once per chunk until socket is ready.`);
+            // this.loggedSocketNotReadyForChunks.add(key); // OLD
+            this.loggedSocketNotReadyForChunks.add(lodKey); // NEW: Use LOD-specific key
         }
         const alreadyInUnsentQueue = this.unsentChunkRequestsQueue.find(
-          req => req.key === key && req.lodLevel === lodLevel
+          // req => req.key === key && req.lodLevel === lodLevel // OLD: req.key is simple
+          req => req.chunkX === chunkX && req.chunkZ === chunkZ && req.lodLevel === lodLevel
         );
         if (!alreadyInUnsentQueue) {
-            this.unsentChunkRequestsQueue.push({ chunkX, chunkZ, lodLevel, resolve, reject, key });
+            // this.unsentChunkRequestsQueue.push({ chunkX, chunkZ, lodLevel, resolve, reject, key: lodKey, seq: this.chunkRequestSeq++ }); // OLD: incremented seq again
+            this.unsentChunkRequestsQueue.push({ chunkX, chunkZ, lodLevel, resolve, reject, key: lodKey, seq: requestSeq }); // NEW: Store the assigned requestSeq and LOD-specific key
         } else {
-            console.warn(`[CM RequestData Debug] Chunk ${key} LOD ${lodLevel}: Socket not ready, AND already in unsent queue. Overwriting queued promise callbacks. Previous caller might not resolve.`);
+            // console.warn(`[CM RequestData Debug] Chunk ${lodKey}: Socket not ready, AND already in unsent queue. Overwriting queued promise callbacks. Previous caller might not resolve.`);
             // Overwrite the resolve/reject of the existing item in the queue with the current ones.
-            // This means the latest request for this chunk (while socket is down) will get its promise fulfilled.
-            alreadyInUnsentQueue.resolve = resolve;
-            alreadyInUnsentQueue.reject = reject;
         }
       }
     });
@@ -1073,5 +1264,19 @@ export class ChunkManager {
     const loaded = this.loadedChunks.size;
     const percentage = target > 0 ? Math.min(1, loaded / target) : 0;
     return { loaded, target, percentage };
+  }
+
+  public setRenderDistance(newDistance: number): void {
+    if (newDistance < 1) newDistance = 1; // Ensure a minimum render distance
+    // console.log(`[ChunkManager] Setting render distance to: ${newDistance}`); // DLOG-CM
+    this.renderDistance = newDistance;
+    this.unloadDistanceChunks = newDistance + 5; // Default buffer of 5
+    this.lastUpdateTime = 0; // Force update in next cycle
+    // Consider if an immediate call to this.update() is needed or if relying on the next game loop tick is sufficient.
+    // Forcing this.lastUpdateTime = 0 should be enough for the existing update loop to pick it up promptly.
+  }
+
+  public getRenderDistance(): number {
+    return this.renderDistance;
   }
 } 

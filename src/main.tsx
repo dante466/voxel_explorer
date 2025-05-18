@@ -69,7 +69,7 @@ function randomInRange(min: number, max: number): number {
 // --- End of helper types and functions ---
 
 // --- Helper function to create star field ---
-function createStarField(starTexture: THREE.Texture | null, numberOfStars = 230, starSphereRadius = 1500): THREE.Points {
+function createStarField(numberOfStars = 230, starSphereRadius = 1500): THREE.Points {
   const positions: number[] = [];
   const colors: number[] = [];
   const sizes: number[] = []; // For individual star sizes
@@ -107,7 +107,6 @@ function createStarField(starTexture: THREE.Texture | null, numberOfStars = 230,
   geometry.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1)); // Add size attribute
 
   const material = new THREE.PointsMaterial({
-    map: starTexture, // Apply the soft particle texture
     vertexColors: true,
     transparent: true,
     blending: THREE.AdditiveBlending,
@@ -245,9 +244,53 @@ async function main() {
   scene.add(playerModelMesh);
   const noiseManager = new NoiseManager(12345);
   const mesherManager = new MesherManager();
-  const chunkManager = new ChunkManager(noiseManager, mesherManager, scene, null, 4, 100, 5);
+  const chunkManager = new ChunkManager(noiseManager, mesherManager, scene, null, 10, 450);
   const initialPlayerX = Transform.position.x[playerEntity];
   const initialPlayerZ = Transform.position.z[playerEntity];
+
+  // Add a label for the render distance slider
+  const renderDistanceLabel = document.createElement('span');
+  renderDistanceLabel.id = 'renderDistanceVal';
+  renderDistanceLabel.textContent = chunkManager.getRenderDistance().toString();
+
+  // Add a slider for render distance
+  const renderDistanceSlider = document.createElement('input');
+  renderDistanceSlider.type = 'range';
+  renderDistanceSlider.id = 'renderDistanceSlider';
+  renderDistanceSlider.min = '1';
+  renderDistanceSlider.max = '35';
+  renderDistanceSlider.step = '1';
+  renderDistanceSlider.value = chunkManager.getRenderDistance().toString(); // Set initial value from ChunkManager
+
+  renderDistanceSlider.addEventListener('input', (event) => {
+    const newDistance = parseInt((event.target as HTMLInputElement).value, 10);
+    if (chunkManager) {
+      chunkManager.setRenderDistance(newDistance);
+    }
+    if (renderDistanceLabel) {
+      renderDistanceLabel.textContent = newDistance.toString();
+    }
+  });
+
+  const debugMenu = document.getElementById('debugMenu');
+  if (debugMenu) {
+    const sliderContainer = document.createElement('div');
+    sliderContainer.style.display = 'flex';
+    sliderContainer.style.alignItems = 'center';
+    sliderContainer.style.marginBottom = '5px';
+
+    const sliderLabelText = document.createElement('span');
+    sliderLabelText.textContent = 'Render Dist: ';
+    sliderLabelText.style.marginRight = '5px';
+
+    sliderContainer.appendChild(sliderLabelText);
+    sliderContainer.appendChild(renderDistanceSlider);
+    sliderContainer.appendChild(renderDistanceLabel);
+    debugMenu.appendChild(sliderContainer);
+  } else {
+    console.warn("[Main] Debug menu div not found, can't add render distance slider.");
+  }
+
   chunkManager.update(initialPlayerX, initialPlayerZ, scene, true)
     .then(() => console.log('[Main] Initial ChunkManager update promise resolved.'))
     .catch(error => console.error('[Main] Initial ChunkManager update promise rejected:', error));
@@ -298,27 +341,38 @@ async function main() {
   const textureLoader = new THREE.TextureLoader();
   let starField: THREE.Points | null = null; // Declare starField here to be accessible
 
-  textureLoader.load(
-    '/soft_particle.png', // Assuming this path
-    function (loadedStarTexture) { // onLoad callback
-      // Create and add star field once texture is loaded
-      starField = createStarField(loadedStarTexture);
-      starField.renderOrder = 999; // Render stars late
-      starField.visible = false; // Initially hidden
-      scene.add(starField);
-      console.log('[Main] Star particle texture loaded and star field created.');
-    },
-    undefined, // onProgress callback (optional)
-    function (error) { // onError callback
-      console.error('[Main] An error occurred loading the star particle texture:', error);
-      // Fallback: Create stars without texture if loading fails
-      starField = createStarField(null); // Pass null for texture
-      starField.renderOrder = 999;
-      starField.visible = false;
-      scene.add(starField);
-      console.warn('[Main] Star field created WITHOUT texture due to loading error.');
-    }
-  );
+  // Load the star particle texture - REMOVED
+  // let starParticleTexture: THREE.Texture | null = null;
+  // textureLoader.load(
+  //   '/soft_particle.png',
+  //   (texture) => {
+  //     starParticleTexture = texture;
+  //     starParticleTexture.colorSpace = THREE.SRGBColorSpace; 
+  //     console.log('[Main] Star particle texture loaded successfully.');
+  //     recreateStarFieldIfNeeded(); // Recreate or update material if stars already exist
+  //   },
+  //   undefined,
+  //   (err) => {
+  //     console.error('[Main] An error occurred loading the star particle texture:', err);
+  //     // If texture fails, starfield will be created with default point appearance
+  //     recreateStarFieldIfNeeded(); 
+  //   }
+  // );
+
+  // function recreateStarFieldIfNeeded() {
+  //   if (starField) {
+  //     scene.remove(starField);
+  //     starField.geometry.dispose();
+  //     (starField.material as THREE.Material).dispose();
+  //   }
+  //   starField = createStarField(starParticleTexture); // Pass the potentially loaded texture
+  //   scene.add(starField);
+  // }
+  // Initial creation - will use null texture if not loaded yet, or default points if it fails.
+  // recreateStarFieldIfNeeded(); 
+  // MODIFIED: Directly create starfield without waiting for the texture.
+  starField = createStarField();
+  scene.add(starField);
 
   // Create Moon Mesh
   const moonRadius = 15;
@@ -347,6 +401,38 @@ async function main() {
         <input type="range" id="timeOfDaySlider" min="0" max="1" step="0.01" value="${timeOfDay}" style="width: 100%;">
     </div>
   `;
+
+  // Create container for the render distance slider elements
+  const renderDistanceContainer = document.createElement('div');
+  const renderDistanceSliderLabelText = document.createElement('label');
+  renderDistanceSliderLabelText.htmlFor = 'renderDistanceSlider';
+  renderDistanceSliderLabelText.textContent = 'Render Dist: ';
+  
+  const renderDistanceValueSpan = document.createElement('span');
+  renderDistanceValueSpan.id = 'renderDistanceVal';
+  renderDistanceValueSpan.textContent = chunkManager.getRenderDistance().toString();
+
+  renderDistanceSliderLabelText.appendChild(renderDistanceValueSpan);
+
+  const renderDistanceSliderElement = document.createElement('input');
+  renderDistanceSliderElement.type = 'range';
+  renderDistanceSliderElement.id = 'renderDistanceSlider';
+  renderDistanceSliderElement.min = '1';
+  renderDistanceSliderElement.max = '35';
+  renderDistanceSliderElement.step = '1';
+  renderDistanceSliderElement.value = chunkManager.getRenderDistance().toString();
+  renderDistanceSliderElement.style.width = '100%';
+
+  renderDistanceSliderElement.addEventListener('input', (event) => {
+    const newDistance = parseInt((event.target as HTMLInputElement).value, 10);
+    chunkManager.setRenderDistance(newDistance);
+    renderDistanceValueSpan.textContent = newDistance.toString();
+  });
+
+  renderDistanceContainer.appendChild(renderDistanceSliderLabelText);
+  renderDistanceContainer.appendChild(renderDistanceSliderElement);
+  menuContent.appendChild(renderDistanceContainer); // Append to admin menu's content
+
   adminMenu.appendChild(menuContent);
   document.body.appendChild(adminMenu);
   const crosshairElement = document.createElement('div');

@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { type ChunkManager } from '../world/ChunkManager';
-import { Chunk, CHUNK_SIZE } from '../world/Chunk';
+import { Chunk } from '../world/Chunk';
+import { CHUNK_SIZE } from '../shared/constants.js';
 
 // Player AABB dimensions (can be moved to a shared constants file later)
 export const PLAYER_COLLISION_WIDTH = 0.6; // meters

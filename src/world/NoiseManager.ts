@@ -1,4 +1,5 @@
-import { Chunk, LODLevel } from './Chunk';
+import { LODLevel } from '../shared/constants.js';
+import { Chunk } from './Chunk';
 
 interface ChunkGenerationRequest {
   chunkX: number;

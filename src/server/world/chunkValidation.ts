@@ -39,13 +39,17 @@ export function replicateClientHeightmapGen(seed: number, chunkX: number, chunkZ
 
   for (let x = 0; x < CHUNK_WIDTH; x++) {
     for (let z = 0; z < CHUNK_DEPTH; z++) {
-      const worldX = chunkX * CHUNK_WIDTH + x;
-      const worldZ = chunkZ * CHUNK_DEPTH + z;
+      const worldXBase = chunkX * CHUNK_WIDTH + x;
+      const worldZBase = chunkZ * CHUNK_DEPTH + z;
+
+      // Sample at the center of the column, like genChunk.ts does for h_voxel_col
+      const sampleX = worldXBase + 0.5;
+      const sampleZ = worldZBase + 0.5;
 
       const h_noise = 
-        noiseFunc1(worldX * NOISE_FREQ_1, worldZ * NOISE_FREQ_1) * NOISE_AMP_1 +
-        noiseFunc2(worldX * NOISE_FREQ_2, worldZ * NOISE_FREQ_2) * NOISE_AMP_2 +
-        noiseFunc3(worldX * NOISE_FREQ_3, worldZ * NOISE_FREQ_3) * NOISE_AMP_3;
+        noiseFunc1(sampleX * NOISE_FREQ_1, sampleZ * NOISE_FREQ_1) * NOISE_AMP_1 +
+        noiseFunc2(sampleX * NOISE_FREQ_2, sampleZ * NOISE_FREQ_2) * NOISE_AMP_2 +
+        noiseFunc3(sampleX * NOISE_FREQ_3, sampleZ * NOISE_FREQ_3) * NOISE_AMP_3;
 
       const normalized_h = h_noise / SUM_AMPS;
       const terrainBase = (normalized_h + 1) * 0.5 * MOUNTAIN_HEIGHT;

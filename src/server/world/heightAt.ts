@@ -14,7 +14,7 @@ function mulberry32(a: number) {
   }
 }
 
-export function makeHeightFn(seed: number) {
+export function makeHeightFn(seed: number, lodLevel: number) {
   const randomFunc1 = mulberry32(seed);
   const randomFunc2 = mulberry32(seed ^ 0xdeadbeef); 
   const randomFunc3 = mulberry32(seed ^ 0x41c64e6d);
@@ -24,17 +24,34 @@ export function makeHeightFn(seed: number) {
   const noiseFunc2 = makeNoise2D(randomFunc2);
   const noiseFunc3 = makeNoise2D(randomFunc3);
 
-  const SUM_AMPS = NOISE_AMP_1 + NOISE_AMP_2 + NOISE_AMP_3;
+  // Adjust sum of amplitudes based on LOD
+  let currentSumAmps = NOISE_AMP_1 + NOISE_AMP_2 + NOISE_AMP_3;
+  if (lodLevel === 1) { // LOW_LOD - use only first two octaves for example
+    currentSumAmps = NOISE_AMP_1 + NOISE_AMP_2;
+  } else if (lodLevel === 2) { // Example for an even LOWER LOD - use only first octave
+    currentSumAmps = NOISE_AMP_1;
+  }
+  // Default (lodLevel === 0 or other) uses all three.
 
   return (wx: number, wz: number): number => {
-    // h_noise is the sum of three noise octaves, each typically in [-1, 1] before amplitude multiplication
-    const h_noise = 
-      noiseFunc1(wx * NOISE_FREQ_1, wz * NOISE_FREQ_1) * NOISE_AMP_1 +
-      noiseFunc2(wx * NOISE_FREQ_2, wz * NOISE_FREQ_2) * NOISE_AMP_2 +
-      noiseFunc3(wx * NOISE_FREQ_3, wz * NOISE_FREQ_3) * NOISE_AMP_3;
+    let h_noise;
+    if (lodLevel === 1) { // LOW_LOD - use only first two octaves
+      h_noise = 
+        noiseFunc1(wx * NOISE_FREQ_1, wz * NOISE_FREQ_1) * NOISE_AMP_1 +
+        noiseFunc2(wx * NOISE_FREQ_2, wz * NOISE_FREQ_2) * NOISE_AMP_2;
+    } else if (lodLevel === 2) { // Even LOWER LOD - use only first octave
+      h_noise = 
+        noiseFunc1(wx * NOISE_FREQ_1, wz * NOISE_FREQ_1) * NOISE_AMP_1;
+    } else { // HIGH_LOD (lodLevel === 0 or default)
+      h_noise = 
+        noiseFunc1(wx * NOISE_FREQ_1, wz * NOISE_FREQ_1) * NOISE_AMP_1 +
+        noiseFunc2(wx * NOISE_FREQ_2, wz * NOISE_FREQ_2) * NOISE_AMP_2 +
+        noiseFunc3(wx * NOISE_FREQ_3, wz * NOISE_FREQ_3) * NOISE_AMP_3;
+    }
 
-    // Normalize combined noise (which can range from -SUM_AMPS to +SUM_AMPS) to roughly [-1, 1]
-    const normalized_h = h_noise / SUM_AMPS;
+    // Normalize combined noise to roughly [-1, 1]
+    // Ensure currentSumAmps is not zero to avoid division by zero if all amps are conditional
+    const normalized_h = currentSumAmps > 0 ? h_noise / currentSumAmps : 0;
 
     // Normalise −1…1 → 0…1, scale by mountain height,
     // then add sea level and base height.

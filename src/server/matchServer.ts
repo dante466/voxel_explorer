@@ -7,7 +7,7 @@ import type { MatchState as IMatchState, PlayerServer, Chunk } from './types.js'
 import { ClientCommandType } from './types.js';
 import { encodeChunkDiff, type VoxelChange } from '../world/encodeChunkDiff.js';
 import { genChunk } from './world/genChunk.js'; // S1-2: Import genChunk
-import { testS1_1_HeightmapConsistency } from './world/chunkValidation.js'; // S1-1 Test
+import { testS1_1_HeightmapConsistency, type ServerGenChunkResult } from './world/chunkValidation.js'; // S1-1 Test, import type
 import { getBlock, setBlock } from './world/voxelIO.js'; // Import from new location
 import { chunkKey } from './world/chunkUtils.js'; // For pre-warming key gen
 import { getOrCreateChunk } from './world/getOrCreateChunk.js'; // Corrected import path
@@ -24,7 +24,8 @@ import * as RAPIER from '@dimforge/rapier3d-compat'; // S3-3: Ensure RAPIER is i
 import * as THREE from 'three'; // Import THREE for math operations
 import { Builder as FlatbuffersBuilder } from 'flatbuffers'; // S3-4 For StateSnapshot broadcast
 import { encodeServerSnapshot, type PlayerData } from '../net/flat.js'; // S3-4 Helper to encode StateSnapshot, renamed, and import PlayerData
-import { PLAYER_SPAWN_POS, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z, BLOCK_AIR } from '../shared/constants'; // S3-2
+import { PLAYER_SPAWN_POS, CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z, BLOCK_AIR, LODLevel } from '../shared/constants'; // S3-2, Added LODLevel
+import { ChunkGenerationQueue } from './world/chunkGenerationQueue.js'; // Added import
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -43,6 +44,7 @@ const MAX_CLIENTS = 10; // Defined MAX_CLIENTS
 const TICK_RATE_MS = 1000 / 30; // Game tick rate in milliseconds
 const GC_INTERVAL_TICKS = 1800; // Approx every 60 seconds (30 ticks/sec * 60 sec)
 const MAX_COLLIDERS_PER_TICK = 1024; // Process more colliders to speed up initial load
+const MAX_COLLIDER_REMOVALS_PER_TICK = 50; // New: Max direct collider removals per tick
 const INITIAL_CHUNK_RADIUS = 1; // For a 3x3 area (center + 1 out)
 const SERVER_FLYING_SPEED = 10.0; // Matches client PLAYER_SPEED_FLYING for C2-1 check
 
@@ -52,11 +54,13 @@ interface MatchState extends IMatchState {
   seed: number;
   physicsWorld: ReturnType<typeof createPhysicsWorld>;
   pendingColliders: (() => void)[];
+  handlesPendingRemoval: number[];
   playersAwaitingFullInit: PlayerServer[];
   initialServerLoadComplete: boolean;
   expectedInitialColliders: number; // For tracking initial collider processing
   initialCollidersProcessedCount: number; // Counter for processed initial colliders
   currentTick: number; // Added for server snapshot tick
+  chunkGenQueue: ChunkGenerationQueue; // Added chunkGenQueue to MatchState
 }
 
 const matchStateStore = new Map<string, MatchState>();
@@ -82,7 +86,11 @@ async function startServer() {
   try {
     const s1_1_seed = DEFAULT_WORLD_SEED; 
     console.log(`[Server] S1-1: Running genChunk heightmap consistency test with seed ${s1_1_seed}...`);
-    const s1_1_test_passed = await testS1_1_HeightmapConsistency(genChunk, s1_1_seed);
+    // Wrapper for genChunk to match the test signature
+    const genChunkForTest = async (seed: number, cX: number, cZ: number): Promise<ServerGenChunkResult> => {
+      return await genChunk(seed, cX, cZ, LODLevel.HIGH); // Use HIGH LOD for this test, added await
+    };
+    const s1_1_test_passed = await testS1_1_HeightmapConsistency(genChunkForTest, s1_1_seed);
     if (s1_1_test_passed) {
       console.log('[Server] S1-1: Heightmap consistency test PASSED.');
     } else {
@@ -99,6 +107,7 @@ async function startServer() {
   const wss = new WebSocketServer({ server });
   const ecsWorld = createServerECSWorld();
   const physicsWorld = createPhysicsWorld();
+  const chunkGenQueueInstance = new ChunkGenerationQueue(4); // Concurrency of 4
 
   const matchState: MatchState = {
     players: new Map(),
@@ -108,11 +117,13 @@ async function startServer() {
     seed: DEFAULT_WORLD_SEED,
     physicsWorld: physicsWorld,
     pendingColliders: [],
+    handlesPendingRemoval: [],
     playersAwaitingFullInit: [],
     initialServerLoadComplete: false,
     expectedInitialColliders: 0,
     initialCollidersProcessedCount: 0,
     currentTick: 0, // Initialize currentTick
+    chunkGenQueue: chunkGenQueueInstance, // Initialize in matchState object
   };
 
   console.log('[Server/Pre-warm] Pre-warming initial chunk area and queueing colliders...');
@@ -123,7 +134,8 @@ async function startServer() {
   for (let cx = -INITIAL_CHUNK_RADIUS; cx <= INITIAL_CHUNK_RADIUS; cx++) {
     for (let cz = -INITIAL_CHUNK_RADIUS; cz <= INITIAL_CHUNK_RADIUS; cz++) {
       preWarmPromises.push(
-        getOrCreateChunk(matchState, matchState.seed, cx, cz)
+        // MODIFIED: Pass LODLevel.HIGH for pre-warmed chunks
+        getOrCreateChunk(matchState, matchState.seed, cx, cz, LODLevel.HIGH)
           .then(chunk => {
             if (chunk) {
               chunksProcessedForPreWarm++;
@@ -383,16 +395,26 @@ async function startServer() {
         break;
       }
       case 'chunkRequest': {
-        const { cx, cz, seq } = message;
+        const { cx, cz, seq, lod } = message;
+        // TODO: Validate lod (e.g., ensure it's a number, perhaps 0 for HIGH, 1 for LOW as per client's LODLevel enum)
+        // For now, we'll assume client sends a valid number representing LODLevel or handle undefined if not sent.
+        const requestedLOD = (typeof lod === 'number' && (lod === 0 || lod === 1)) ? lod : 0; // Default to LOD 0 (HIGH) if invalid/missing
+
+        console.log(`[Server ChunkRequest] Received for cx: ${cx}, cz: ${cz}, lod: ${requestedLOD}, seq: ${seq} from player ${cmdPlayerId}`); // Added log
+
         if (typeof cx !== 'number' || typeof cz !== 'number') {
           sendError(ws, 'chunkResponseError', seq, 'BadRequest', 'Invalid cx/cz.');
           return;
         }
         try {
-          const chunk = await getOrCreateChunk(currentMatchState, currentMatchState.seed, cx, cz);
+          // MODIFIED: Pass requestedLOD to getOrCreateChunk
+          const chunk = await getOrCreateChunk(currentMatchState, currentMatchState.seed, cx, cz, requestedLOD);
           const voxelsArray = Array.from(chunk.data);
           if (ws.readyState === ServerWebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'chunkResponse', cx, cz, voxels: voxelsArray, seq }));
+            // ADDED requestedLOD to the response as 'lod'
+            const responseMessage = { type: 'chunkResponse', cx, cz, voxels: voxelsArray, seq, lod: requestedLOD };
+            ws.send(JSON.stringify(responseMessage));
+            console.log(`[Server ChunkResponse] Sent for cx: ${cx}, cz: ${cz}, lod: ${requestedLOD}, seq: ${seq} to player ${cmdPlayerId}`); // Added log
           }
         } catch (error) {
           console.error(`[Server] Error processing chunk request for ${cx},${cz}:`, error);
@@ -501,6 +523,7 @@ async function startServer() {
   // Game loop using setInterval
   let gcTickCounter = 0;
   let tickMod = 0; // Added for S5 snapshot throttling
+  let queueLogTickCounter = 0; // Added for queue status logging
 
   setInterval(() => {
     const now = Date.now();
@@ -508,16 +531,40 @@ async function startServer() {
     matchState.lastUpdate = now;
     matchState.currentTick++; // Increment currentTick
 
-    // 1. Process pending colliders
-    const collidersToProcessThisTick = Math.min(matchState.pendingColliders.length, MAX_COLLIDERS_PER_TICK);
-    for (let i = 0; i < collidersToProcessThisTick; i++) {
+    // 1. Process pending COLLIDER CREATION tasks (from pendingColliders queue)
+    // This queue should ideally only contain creation tasks now.
+    const collidersToCreateThisTick = Math.min(matchState.pendingColliders.length, MAX_COLLIDERS_PER_TICK);
+    for (let i = 0; i < collidersToCreateThisTick; i++) {
       const colliderTask = matchState.pendingColliders.shift();
       if (colliderTask) {
         colliderTask();
         if (!matchState.initialServerLoadComplete) {
           matchState.initialCollidersProcessedCount++;
-           // console.log(`[Server Game Loop] Initial colliders processed: ${matchState.initialCollidersProcessedCount}/${matchState.expectedInitialColliders}`);
         }
+      }
+    }
+
+    // 2. Process pending COLLIDER REMOVAL tasks (from handlesPendingRemoval queue)
+    if (matchState.handlesPendingRemoval && matchState.physicsWorld?.raw) {
+      const world = matchState.physicsWorld.raw;
+      const removalsToProcessThisTick = Math.min(matchState.handlesPendingRemoval.length, MAX_COLLIDER_REMOVALS_PER_TICK);
+      for (let i = 0; i < removalsToProcessThisTick; i++) {
+        const handle = matchState.handlesPendingRemoval.shift();
+        if (handle !== undefined) {
+          try {
+            const collider = world.getCollider(handle);
+            if (collider) {
+              world.removeCollider(collider, true); // wakeUp: true
+            } else {
+              // console.warn(`[GC Remove] Collider handle ${handle} not found in world, skipping removal.`);
+            }
+          } catch (e) {
+            console.error(`[GC Remove] Error removing collider handle ${handle}:`, e);
+          }
+        }
+      }
+      if (removalsToProcessThisTick > 0 && matchState.handlesPendingRemoval.length > 0) {
+        // console.log(`[GC Remove] Processed ${removalsToProcessThisTick} removals. Remaining: ${matchState.handlesPendingRemoval.length}`);
       }
     }
 
@@ -536,8 +583,8 @@ async function startServer() {
         if (player.ws.readyState === ServerWebSocket.OPEN) {
           try {
             let spawnY = PLAYER_SPAWN_POS.y;
-            const spawnChunkKey = chunkKey(0, 0); // Key for the spawn chunk (0,0)
-            const spawnChunk = matchState.chunks.get(spawnChunkKey); // Use matchState
+            const spawnChunkKeyWithLOD = `0,0,L${LODLevel.HIGH}`; // Correct key for pre-warmed HIGH LOD chunk
+            const spawnChunk = matchState.chunks.get(spawnChunkKeyWithLOD); 
 
             if (spawnChunk && spawnChunk.heightmap && spawnChunk.heightmap.length === CHUNK_SIZE_X * CHUNK_SIZE_Z) {
               const heightAtSpawn = spawnChunk.heightmap[0]; // Height at local 0,0 within chunk 0,0
@@ -626,6 +673,14 @@ async function startServer() {
       broadcastState(wss, matchState, matchState.currentTick); // Pass currentTick
     }
 
+    // Log ChunkGenerationQueue status periodically
+    queueLogTickCounter++;
+    if (queueLogTickCounter % 150 === 0) { // Log approx every 5 seconds (150 ticks / 30 ticks/sec)
+      const queueStatus = matchState.chunkGenQueue.getQueueStatus();
+      console.log(`[Server ChunkQueue Status] Size: ${queueStatus.queueSize}, Processing: ${queueStatus.processingCount}`);
+      queueLogTickCounter = 0;
+    }
+
     if ((gcTickCounter += 1) >= GC_INTERVAL_TICKS) { 
       if (matchState.physicsWorld && matchState.physicsWorld.raw) {
         sweepInactiveChunks(matchState.physicsWorld.raw, matchState);
@@ -634,66 +689,76 @@ async function startServer() {
     }
   }, TICK_RATE_MS);
 
-  function broadcastState(wssInstance: WebSocketServer, currentState: MatchState, tick: number) {
-    const playerStates: PlayerData[] = []; // Use PlayerData interface for type safety
-    const builder = new FlatbuffersBuilder(1024); // Create a builder instance
-
-    // Server-side logging: Log state details before sending
-    if (currentState.players.size > 0) { // Only log if there are players to broadcast
-      console.log(`--- SERVER BROADCASTING STATE (Tick: ${tick}) ---`);
+  function broadcastState(wssInstance: WebSocketServer, currentMatchState: MatchState, tick: number) {
+    if (currentMatchState.players.size === 0 && currentMatchState.playersAwaitingFullInit.length === 0) {
+      // console.log(`[Server Broadcast State Tick: ${tick}] No players connected. Skipping broadcast.`);
+      return;
     }
 
-    currentState.players.forEach((player, playerId) => {
-      if (player.bodyHandle === undefined || player.colliderHandle === undefined) {
-          // console.warn(`[BroadcastState] Player ${player.id} skipped, missing body/collider handle.`);
-          return; // Skip players not fully initialized in physics world
+    const builder = new FlatbuffersBuilder(1024); // Initialize builder here
+    const playerStatesForSnapshot: PlayerData[] = [];
+
+    currentMatchState.players.forEach((player, id) => {
+      if (!player.bodyHandle) {
+        // console.log(`[Server Broadcast State Tick: ${tick}] Player ${id} has no bodyHandle. Skipping.`);
+        return;
       }
-      const body = currentState.physicsWorld.raw.getRigidBody(player.bodyHandle);
+      const body = currentMatchState.physicsWorld.raw.getRigidBody(player.bodyHandle);
       if (!body) {
-          // console.warn(`[BroadcastState] Player ${player.id} skipped, physics body not found.`);
-          return; // Skip if body somehow became invalid
+        // console.log(`[Server Broadcast State Tick: ${tick}] Player ${id} body not found. Skipping.`);
+        return;
       }
-      const position = body.translation();
-      const velocity = body.linvel(); // Get linear velocity from physics body
-      const serverIsGrounded = checkIsOnGround(body, currentState.physicsWorld.raw, currentState.chunks, currentState, playerId);
-      const serverIsFlying = player.isFlying !== undefined ? player.isFlying : false;
-      const serverLastAck = player.lastProcessedInputSeq !== undefined ? player.lastProcessedInputSeq : 0;
 
-      // Log details for this player before adding to snapshot
-      console.log(`  Player: ${player.id}`);
-      console.log(`    Auth Pos: {x: ${position.x.toFixed(3)}, y: ${position.y.toFixed(3)}, z: ${position.z.toFixed(3)}}`);
-      console.log(`    Auth Vel: {x: ${velocity.x.toFixed(3)}, y: ${velocity.y.toFixed(3)}, z: ${velocity.z.toFixed(3)}}`);
-      console.log(`    Auth isGrounded: ${serverIsGrounded}, Auth isFlying: ${serverIsFlying}, Auth lastAck: ${serverLastAck}`);
+      const pos = body.translation();
+      const lvel = body.linvel();
+      
+      const serverIsGrounded = checkIsOnGround(
+        body, 
+        currentMatchState.physicsWorld.raw, 
+        currentMatchState.chunks,
+        currentMatchState, 
+        player.id
+      );
 
-      // PlayerData structure expected by encodeServerSnapshot
-      const playerData: PlayerData = { // Explicitly type with PlayerData
-        id: player.id,
-        position: { x: position.x, y: position.y, z: position.z }, // Corrected: 'pos' to 'position'
-        vel: { x: velocity.x, y: velocity.y, z: velocity.z }, // Send current velocity
-        yaw: player.yaw !== undefined ? player.yaw : 0, // Send current server yaw
-        isFlying: serverIsFlying, // Send server flying state
-        isGrounded: serverIsGrounded, // Add the server-authoritative grounded status
-        lastAck: serverLastAck // Handle potential undefined
+      const playerData: PlayerData = {
+        id,
+        position: { x: pos.x, y: pos.y, z: pos.z },
+        vel:      { x: lvel.x, y: lvel.y, z: lvel.z },
+        yaw:      player.yaw ?? 0, 
+        isGrounded: serverIsGrounded,
+        isFlying:  player.isFlying ?? false, 
+        lastAck:   player.lastProcessedInputSeq ?? 0, 
       };
-      playerStates.push(playerData);
+      playerStatesForSnapshot.push(playerData);
+
+      // Verbose logging, can be removed or made conditional
+      // if (tick % 30 === 0) { // Log once per second
+      //   console.log(`[Server Broadcast State Tick: ${tick}] Player ${id}: Pos(${pos.x.toFixed(2)}, ${pos.y.toFixed(2)}, ${pos.z.toFixed(2)}), Linvel(${lvel.x.toFixed(2)}, ${lvel.y.toFixed(2)}, ${lvel.z.toFixed(2)}), Yaw(${player.yaw.toFixed(2)}), Grounded(${serverIsGrounded}), Flying(${player.isFlying}), Ack(${player.lastProcessedInputSeq})`);
+      // }
     });
 
-    if (playerStates.length > 0) {
-      console.log(`--- END SERVER BROADCAST (Tick: ${tick}) ---`); // Footer for server log block
-      // tick is now passed as an argument
-      
-      // Use encodeServerSnapshot which expects an array of plain PlayerData objects
-      // Pass the builder as the first argument
-      const flatBuffer = encodeServerSnapshot(builder, tick, playerStates);
+    if (playerStatesForSnapshot.length > 0) {
+      // console.log(`[Server Broadcast State Tick: ${tick}] Broadcasting state for ${playerStatesForSnapshot.length} player(s).`);
+      // console.log(`--- BEGIN SERVER BROADCAST (Tick: ${tick}) ---`); // Header for server log block
+
+      const flatBuffer = encodeServerSnapshot(builder, tick, playerStatesForSnapshot);
 
       if (flatBuffer) {
+        const binaryPayload = flatBuffer.subarray(builder.dataBuffer().position(), builder.dataBuffer().capacity());
+        // console.log(`[Server Broadcast State Tick: ${tick}] Sending snapshot of size ${binaryPayload.byteLength} bytes.`);
         wssInstance.clients.forEach(client => {
-              if (client.readyState === ServerWebSocket.OPEN) {
-            client.send(flatBuffer);
-              }
-            });
-        }
+          if (client.readyState === ServerWebSocket.OPEN) {
+            client.send(binaryPayload, { binary: true });
+          }
+        });
+      } else {
+        console.warn(`[Server Broadcast State Tick: ${tick}] Failed to encode server snapshot.`);
+      }
+      // console.log(`--- END SERVER BROADCAST (Tick: ${tick}) ---`); // Footer for server log block
+    } else {
+      // console.log(`[Server Broadcast State Tick: ${tick}] No player states to broadcast.`);
     }
+    builder.clear(); // Good practice to clear the builder
   }
 
   // Helper function (you'll need to implement its logic based on your world data)
@@ -713,7 +778,7 @@ async function startServer() {
     const solid = true; // Check against solid colliders
     const hit = physicsWorld.castRay(ray, maxToi, solid);
 
-    console.log(`[Server CheckIsOnGround Player: ${playerIdForLog}] Body Origin: (${origin.x.toFixed(2)}, ${origin.y.toFixed(2)}, ${origin.z.toFixed(2)}), Ray Origin: (${rayOrigin.x.toFixed(2)}, ${rayOrigin.y.toFixed(2)}, ${rayOrigin.z.toFixed(2)}), Hit: ${hit !== null}, ToI: ${hit?.toi.toFixed(2) ?? 'N/A'}`);
+    // console.log(`[Server CheckIsOnGround Player: ${playerIdForLog}] Body Origin: (${origin.x.toFixed(2)}, ${origin.y.toFixed(2)}, ${origin.z.toFixed(2)}), Ray Origin: (${rayOrigin.x.toFixed(2)}, ${rayOrigin.y.toFixed(2)}, ${rayOrigin.z.toFixed(2)}), Hit: ${hit !== null}, ToI: ${hit?.toi.toFixed(2) ?? 'N/A'}`);
     return hit !== null;
   }
 } // End of startServer async function

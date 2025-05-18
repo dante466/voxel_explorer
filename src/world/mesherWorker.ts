@@ -1,4 +1,4 @@
-import { LODLevel, CHUNK_SIZE, LOD_CHUNK_SIZE } from './Chunk';
+import { LODLevel, CHUNK_SIZE, LOD_CHUNK_SIZE } from '../shared/constants.js';
 import { BlockId, getBlockType, getUVsForTile, ATLAS_COLS, ATLAS_ROWS, DIRT_TILE } from '../world/blockTypes';
 
 // Message types
