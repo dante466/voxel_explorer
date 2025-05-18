@@ -1,6 +1,6 @@
 import { removeChunkColliders } from '../physics/removeChunkColliders.js';
 import { CHUNK_SIZE_X, CHUNK_SIZE_Z } from '../../shared/constants.js';
-import type { MatchState, Player, Chunk as ServerChunk } from '../types.js';
+import type { MatchState, PlayerServer as Player, Chunk as ServerChunk } from '../types.js';
 import type RAPIER from '@dimforge/rapier3d-compat';
 
 const GC_RADIUS = 160; // metres. Chunks outside this radius from ALL players may be GC'd.
@@ -43,10 +43,22 @@ export function sweepInactiveChunks(
 
       // Check against each player
       for (const player of state.players.values()) {
-        // Using player.position (simple x,y,z from server state) for now as per discussion.
-        // TODO: Replace with player.body.translation() when server-side player physics bodies are robust.
-        const dx = player.position.x - chunkWorldX;
-        const dz = player.position.z - chunkWorldZ;
+        // Get player's physics body
+        if (player.bodyHandle === undefined) {
+          // console.warn(`[ChunkGC] Player ${player.id} has no bodyHandle, skipping for distance check.`);
+          continue; // Skip this player if their bodyHandle isn't set
+        }
+        const playerBody = state.physicsWorld?.raw.getRigidBody(player.bodyHandle);
+
+        if (!playerBody) {
+          // console.warn(`[ChunkGC] Player ${player.id} has no physics body, skipping for distance check.`);
+          continue; // Skip this player if their body doesn't exist for some reason
+        }
+
+        const playerPosition = playerBody.translation();
+        
+        const dx = playerPosition.x - chunkWorldX;
+        const dz = playerPosition.z - chunkWorldZ;
         
         if ((dx * dx + dz * dz) < GC_RADIUS_SQUARED) {
           // This chunk is near at least one player, so keep it.

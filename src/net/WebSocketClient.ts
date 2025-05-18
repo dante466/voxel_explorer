@@ -10,7 +10,7 @@ export class WebSocketClient {
   };
   private reconnectTimeout: number | null = null;
   private url: string;
-  public onMessage: ((message: string) => void) | null = null;
+  public onMessage: ((message: string | ArrayBuffer) => void) | null = null;
   public onOpenCallback: ((socket: WebSocket) => void) | null = null;
 
   constructor(url: string, onOpenCallback?: (socket: WebSocket) => void) {
@@ -34,6 +34,8 @@ export class WebSocketClient {
 
   private setupWebSocketHandlers(): void {
     if (!this.ws) return;
+
+    this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = () => {
       console.log('[WebSocketClient] WebSocket connected. Firing onOpenCallback.');
@@ -91,12 +93,24 @@ export class WebSocketClient {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
     try {
-      // TODO: Convert command to FlatBuffer format
       const message = JSON.stringify(command);
       this.ws.send(message);
     } catch (error) {
       console.error('Failed to send command:', error);
     }
+  }
+
+  public sendBinaryCommand(data: BufferSource): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(data);
+    } catch (error) {
+      console.error('Failed to send binary command:', error);
+    }
+  }
+
+  public getSocket(): WebSocket | null {
+    return this.ws;
   }
 
   public disconnect(): void {

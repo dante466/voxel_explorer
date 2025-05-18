@@ -57,6 +57,8 @@ export function buildChunkColliders(
         // Note: setTranslation will be done in the closure, allowing it to be dynamic if needed, though here it's fixed.
         const colliderDesc = RAPIER.ColliderDesc.cuboid(halfBlock, actualColliderHalfHeight, halfBlock);
 
+        console.log(`[Server BuildChunkColliders] Chunk (${cx},${cz}), Column (${x},${z}): Solid. minY=${columnTopY}, maxY=${columnTopY}, halfHeight=${actualColliderHalfHeight.toFixed(2)}, posY=${actualColliderCenterY.toFixed(2)}. World Pos: (${(wx + 0.5).toFixed(2)}, ${actualColliderCenterY.toFixed(2)}, ${(wz + 0.5).toFixed(2)})`);
+
         matchState.pendingColliders.push(() => {
           try {
             const body = world.createRigidBody(rigidBodyDesc.setTranslation(wx, wy, wz));

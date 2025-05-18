@@ -151,11 +151,77 @@ export class Chunk {
     }
     this.data = rawData;
     this.compressedData = null; // Invalidate compression cache
+    this.regenerateHeightmapFromData();
   }
 
   // Fill chunk with a single value
   fill(value: number): void {
     this.data.fill(value);
     this.compressedData = null;
+    this.regenerateHeightmapFromData();
+  }
+
+  // New method to regenerate heightmap
+  private regenerateHeightmapFromData(): void {
+    const size = this.getSizeConstants(); // Use LOD-aware sizes for iterating data
+    const heightmapSize = CHUNK_SIZE.WIDTH * CHUNK_SIZE.DEPTH; // Heightmap is always 32x32 as per current init
+
+    if (this.heightmap.length !== heightmapSize) {
+      // This case should ideally not happen if constructor is consistent, but as a safeguard:
+      console.warn(`[Chunk] Heightmap has unexpected size (${this.heightmap.length}), re-initializing to ${heightmapSize}. LOD: ${this.lodLevel}`);
+      this.heightmap = new Uint8Array(heightmapSize);
+    }
+    
+    // If chunk data is LOW LOD, we might need a strategy to map it to a HIGH LOD 32x32 heightmap,
+    // or the heightmap itself should be LOD-aware in size.
+    // For now, assuming we generate a 32x32 heightmap.
+    // If size.WIDTH/DEPTH are different from CHUNK_SIZE.WIDTH/DEPTH (i.e. LOW LOD), this will be problematic.
+    // Let\'s proceed with assumption that heightmap is always based on CHUNK_SIZE (32x32) for now.
+    // And that voxel data, even if LOW_LOD, will be iterated in a way that can inform this.
+
+    // Simplification: if this is a LOW_LOD chunk, this heightmap generation will be incorrect
+    // as it assumes iteration up to CHUNK_SIZE.HEIGHT using CHUNK_SIZE.WIDTH/DEPTH for indexing into heightmap.
+    // This needs refinement if LOW_LOD chunks are actively used with this heightmap logic.
+    // For S1-3, client requests HIGH LOD, so this should be okay for now.
+    
+    for (let lx = 0; lx < CHUNK_SIZE.WIDTH; lx++) { // Renamed x to lx to avoid conflict with this.x
+      for (let lz = 0; lz < CHUNK_SIZE.DEPTH; lz++) { // Renamed z to lz to avoid conflict with this.z
+        let yMax = 0; // Default to 0 if no solid block found
+        
+        // DEBUG LOGGING START
+        if (this.x === -1 && this.z === -1 && lx === 31 && lz === 21 && import.meta.env.DEV) {
+          console.log(`[HMap Scan Entry] Chunk(${this.x},${this.z}) Col(${lx},${lz}) --- Begin Y Scan ---`);
+        }
+        // DEBUG LOGGING END
+
+        for (let y = size.HEIGHT - 1; y >= 0; y--) {
+          const voxelValue = this.getVoxel(lx, y, lz); 
+          
+          // DEBUG LOGGING START
+          if (this.x === -1 && this.z === -1 && lx === 31 && lz === 21 && (y >= 98 && y <= 101) && import.meta.env.DEV) {
+            console.log(`[HMap Scan Detail] Chunk(${this.x},${this.z}) Col(${lx},${lz}) Y=${y}, Voxel=${voxelValue}`);
+          }
+          // DEBUG LOGGING END
+          
+          if (voxelValue !== 0) { 
+            yMax = y;
+            // DEBUG LOGGING START
+            if (this.x === -1 && this.z === -1 && lx === 31 && lz === 21 && import.meta.env.DEV) {
+              console.log(`[HMap Scan FoundSolid] Chunk(${this.x},${this.z}) Col(${lx},${lz}) Solid at Y=${y}. Set yMax=${yMax}. Breaking.`);
+            }
+            // DEBUG LOGGING END
+            break;
+          }
+        }
+        // DEBUG LOGGING START
+        if (this.x === -1 && this.z === -1 && lx === 31 && lz === 21 && import.meta.env.DEV) {
+          console.log(`[HMap Scan Result] Chunk(${this.x},${this.z}) Col(${lx},${lz}) Final yMax for assign = ${yMax}`);
+        }
+        // DEBUG LOGGING END
+        const heightmapIndex = lz * CHUNK_SIZE.WIDTH + lx; // Corrected indexing: lz first, then lx
+        this.heightmap[heightmapIndex] = yMax;
+      }
+    }
+    // console.log(`[Chunk ${this.x},${this.z}] Regenerated heightmap. Sample H[0,0]=${this.heightmap[0]}`);
   }
 } 

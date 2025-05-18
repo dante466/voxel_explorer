@@ -41,10 +41,8 @@ export class InputHandler {
       moveBackward: this.keys.has('s'),
       moveLeft: this.keys.has('a'),
       moveRight: this.keys.has('d'),
-      moveUp: this.keys.has('q'),
-      moveDown: this.keys.has('e'),
-      mouseX: this.mouseX,
-      mouseY: this.mouseY,
+      mouseDeltaX: this.mouseX,
+      mouseDeltaY: this.mouseY,
       timestamp: Date.now()
     };
   }

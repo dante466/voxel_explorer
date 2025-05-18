@@ -23,6 +23,7 @@ export async function getOrCreateChunk(
         x: cx,
         z: cz,
         data: generatedChunkData.voxels,
+        heightmap: generatedChunkData.heightmap,
         lastModified: generatedChunkData.lastModified,
         colliderHandles: [], // Initialize as empty, will be populated by queued closures
     };

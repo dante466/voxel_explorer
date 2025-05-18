@@ -1,314 +1,506 @@
 import { InputHandler } from './InputHandler';
 import { WebSocketClient } from './WebSocketClient';
-import type { ClientCommand } from './types';
+import type { ClientCommand, ConnectionState } from './types'; // Keep ConnectionState if used, remove if not
 import { ClientCommandType } from './types';
-import type { IWorld } from 'bitecs'; // Import IWorld
-import { Transform } from '../ecs/world'; // Import Transform component
-import { CameraTarget } from '../ecs/components/CameraTarget'; // For cameraYaw
-import { calculatePlayerMovement, type PlayerMovementInputState, type PlayerMovementOutputState, type PlayerMovementSystemControls } from '../ecs/systems/PlayerMovementSystem'; // For replaying inputs
-import { type ChunkManager } from '../world/ChunkManager'; // Required by calculatePlayerMovement
-import * as THREE from 'three'; // For THREE.Vector3 in reconciliation
-// import * as THREE from 'three'; // THREE is no longer directly used for camera
+import { type IWorld, addEntity, addComponent, hasComponent, removeEntity } from 'bitecs';
+import { Transform } from '../ecs/world'; // Attempting import from world.ts
+import { Object3DRef, object3DMap } from '../ecs/systems/transformSystem';
+import { CameraTarget } from '../ecs/components/CameraTarget'; // For reading current camera yaw
+import { 
+    calculatePlayerMovement, 
+    type PlayerMovementInputState, 
+    // type PlayerMovementOutputState, // Not directly used by NetworkManager's public interface/pending types
+    type PlayerMovementSystemControls 
+} from '../ecs/systems/PlayerMovementSystem';
+import { ChunkManager } from '../world/ChunkManager';
+import * as THREE from 'three';
+import { FIXED_DT_S } from '../time/fixedStep.js'; // Import FIXED_DT_S
 
+// FlatBuffers imports
+import * as flatbuffers from 'flatbuffers'; // Import flatbuffers namespace for Builder
+import { GameSchema } from '../generated/flatbuffers/game.js';
+// M1-1: Use PlayerInput and ServerSnapshot from the schema
+const { ServerSnapshot, PlayerInput, Vec3: FbVec3 } = GameSchema; 
+// M1-1: Update import to use decodeServerSnapshot
+import { decodeServerSnapshot } from './flat.js'; 
+import { ByteBuffer } from 'flatbuffers'; // Added for client-side decode test
+
+// Local type for pending inputs, specific to NetworkManager's reconciliation needs
 interface PendingInput {
   seq: number;
-  keys: { [key: string]: boolean }; // Captured key states
-  cameraYaw: number;
+  // deltaTime: number; // Removed for C4-1
+  numFixedTicks: number; // Added for C4-1: Number of FIXED_DT_S steps this input covers
+  cameraYaw: number; // Absolute camera yaw at the time of input
   currentIsFlying: boolean;
-  deltaTime: number;
-  // The raw ClientCommand is stored for sending, not directly for replay with calculatePlayerMovement
-  rawCommand: ClientCommand; 
+  keys: { [key: string]: boolean };
+  currentHorizontalVelocity: THREE.Vector2; // C1-1: Added to PendingInput
+}
+
+// S3-3: Interface for comparing input state to reduce network spam
+interface PlayerInputStateForCompare {
+  forward: boolean;
+  backward: boolean;
+  left: boolean;
+  right: boolean;
+  mouseYawDelta: number; // Store the actual delta, not the scaled value for FBS
 }
 
 export class NetworkManager {
   private inputHandler: InputHandler;
   private wsClient: WebSocketClient;
-  private commandInterval: number | null = null;
-  private readonly COMMAND_RATE = 30; // 30 Hz command rate
-  // private camera: THREE.PerspectiveCamera; // REMOVED
-  private moveSpeed: number = 2.0; // This might be used differently or removed if prediction logic changes significantly
 
   private world: IWorld;
   private playerEntityId: number;
-  private movementSystemControls: PlayerMovementSystemControls; // To get isFlying and keyStates
-  private chunkManager: ChunkManager; // For calculatePlayerMovement
+  private movementControls: PlayerMovementSystemControls;
+  private chunkManager: ChunkManager;
+  private scene: THREE.Scene;
 
-  private clientInputSequenceNumber = 0;
   private pendingInputs: PendingInput[] = [];
-
-  // Temporary vectors for calculations to avoid allocations in loop
-  private tempCurrentPosition = new THREE.Vector3();
-  // private tempServerPosition = new THREE.Vector3(); // No longer used here
+  private commandLoopInterval: number | null = null;
+  private lastSentInputSeq = 0;
+  private localPlayerLastProcessedInputSeq: number = 0; // For local player
+  private currentServerPlayerId: string | null = null;
+  private serverAuthoritativeIsGrounded: boolean = false; // Triage Kit 1-A: Store server's grounded state
+  private remotePlayerEntities: Map<string, number> = new Map();
+  private remotePlayerModels: Map<string, THREE.Mesh> = new Map();
+  private onServerInitialized: (() => void) | null = null;
+  private lastSentPlayerInputState: PlayerInputStateForCompare | null = null; // S3-3: Added
+  private snapshotErrorLogThrottle = 0; // DLOG-1: Counter for throttling error logs
 
   constructor(
     serverUrl: string, 
     world: IWorld, 
     playerEntityId: number, 
-    movementSystemControls: PlayerMovementSystemControls, // Added
-    chunkManager: ChunkManager // Added
+    movementControls: PlayerMovementSystemControls,
+    chunkManager: ChunkManager,
+    scene: THREE.Scene,
+    onServerInitialized?: () => void
   ) {
-    this.inputHandler = new InputHandler();
+    this.inputHandler = new InputHandler(); // Role to be reviewed, especially for mouseDelta
     this.world = world;
     this.playerEntityId = playerEntityId;
-    this.movementSystemControls = movementSystemControls;
+    this.movementControls = movementControls;
     this.chunkManager = chunkManager;
-    // this.camera = camera; // REMOVED
+    this.scene = scene;
+    this.onServerInitialized = onServerInitialized || null;
 
-    // Provide onOpen callback to WebSocketClient
     this.wsClient = new WebSocketClient(serverUrl, (socket) => {
-      console.log('[NetworkManager] onOpenCallback received from WebSocketClient.');
       if (this.chunkManager) {
-        console.log('[NetworkManager] chunkManager found, calling chunkManager.setSocket.');
         this.chunkManager.setSocket(socket);
-      } else {
-        console.warn('[NetworkManager] chunkManager NOT found when onOpenCallback fired.');
       }
+      this.startCommandLoop();
     });
 
-    this.setupMessageHandler();
-  }
-
-  private setupMessageHandler(): void {
-    this.wsClient.onMessage = (message: string) => {
-      try {
-        const data = JSON.parse(message);
-        
-        // First, check for chunkManager specific messages if chunkManager is available
-        if (this.chunkManager) {
-          if (data.type === 'chunkResponse') {
-            if (typeof data.cx === 'number' && typeof data.cz === 'number' && Array.isArray(data.voxels)) {
-              this.chunkManager.handleChunkResponse(data.cx, data.cz, data.voxels.filter((v: any) => typeof v === 'number'));
-            } else {
-              console.warn('[NetworkManager] Received malformed chunkResponse:', data);
-            }
-            return; // Message handled by ChunkManager
-          } else if (data.type === 'chunkResponseError') {
-            if (typeof data.cx === 'number' && typeof data.cz === 'number' && typeof data.reason === 'string') {
-              this.chunkManager.handleChunkResponseError(data.cx, data.cz, data.reason);
-            } else {
-              console.warn('[NetworkManager] Received malformed chunkResponseError:', data);
-            }
-            return; // Message handled by ChunkManager
-          }
+    this.wsClient.onMessage = (data: string | ArrayBuffer) => {
+      if (typeof data === 'string') {
+        try {
+          const message = JSON.parse(data);
+          this.handleServerMessage(message);
+        } catch (error) {
+          console.error('[NetworkManager] Error parsing JSON message:', error, data);
         }
+      } else if (data instanceof ArrayBuffer) {
+        try {
+          const buffer = new Uint8Array(data);
+          const snapshot = decodeServerSnapshot(buffer); // Returns GameSchema.ServerSnapshot
 
-        if (data.type === 'stateUpdate' && data.state && data.state.id === this.playerEntityId) {
-          const serverState = data.state;
-          // console.log('Received server state:', serverState);
+          // M1-1: Access ServerSnapshot fields directly instead of unpacking
+          const serverTick = snapshot.tick(); // Example: Get tick
+          const numPlayers = snapshot.playersLength();
+          // console.log(`[NetMan StateUpdate] Received ServerSnapshot tick: ${serverTick}, numPlayers: ${numPlayers}`);
 
-          // Update Transform to server state (snap)
-          Transform.position.x[this.playerEntityId] = serverState.position.x;
-          Transform.position.y[this.playerEntityId] = serverState.position.y;
-          Transform.position.z[this.playerEntityId] = serverState.position.z;
-          
-          Transform.rotation.x[this.playerEntityId] = serverState.rotation.x;
-          Transform.rotation.y[this.playerEntityId] = serverState.rotation.y;
-          Transform.rotation.z[this.playerEntityId] = serverState.rotation.z;
-          Transform.rotation.w[this.playerEntityId] = serverState.rotation.w;
+          const serverPlayerIds = new Set<string>();
+          for (let i = 0; i < numPlayers; i++) {
+            const playerState = snapshot.players(i); // Returns GameSchema.PlayerState
+            if (!playerState) continue;
 
-          // Remove acknowledged inputs
-          this.pendingInputs = this.pendingInputs.filter(input => input.seq > serverState.lastProcessedInputSeq);
-          
-          // Replay pending inputs
-          let currentYVelocity = 0; // This needs to be managed across replays if PlayerMovementSystem's yVelocity isn't directly accessible
-                                    // For simplicity, assuming yVelocity is reset or implicitly handled by calculatePlayerMovement logic for short replays.
-                                    // A more robust solution might need PlayerMovementSystem to expose its yVelocity or for calculatePlayerMovement to also return it for the next iteration.
-                                    // The current calculatePlayerMovement takes currentYVelocity and returns newYVelocity. We need to thread this.
+            const playerId = playerState.id();
+            const playerPosition = playerState.position(); // Returns GameSchema.Vec3
+            const playerVel = playerState.vel(); // N1-1: Get velocity from snapshot
 
-          // Get the yVelocity that corresponds to the server state (or make an assumption)
-          // This is tricky because yVelocity is internal to PlayerMovementSystem. 
-          // For now, we might have to reset it or rely on the ground check in calculatePlayerMovement.
-          // Let's assume for the replay, yVelocity starts fresh or is based on what calculatePlayerMovement does.
-          // If the serverState also included yVelocity, that would be ideal.
-          // For now, we will fetch the PlayerMovementSystem's current yVelocity. This is not perfect as it has advanced since the server state.
-          // This is a known simplification for now.
+            if (!playerId || !playerPosition || !playerVel) continue; // N1-1: Ensure playerVel is also present
+            const currentIterationPlayerId = String(playerId); 
+            const playerIsGrounded = playerState.isGrounded(); // Triage Kit 1-A: Read from snapshot
 
-          // After snapping to server state, capture the current yVelocity from PlayerMovementSystem
-          // This isn't ideal because playerMovementSystem's yVelocity is ahead.
-          // A better approach: if calculatePlayerMovement returned newYVelocity, we'd use that iteratively.
-          // The refactored `calculatePlayerMovement` *does* return newYVelocity.
-          
-          // Let's refine replay: yVelocity must be threaded through the replay loop.
-          // We need to know the yVelocity *at the server state*. This is missing.
-          // Simplification: Assume player is on ground or flying if yVelocity is not sent by server.
-          // Or, get the yVelocity from the current player entity state (which is now server state)
-          // and hope it's somewhat relevant. This is a point of potential inaccuracy.
+            serverPlayerIds.add(currentIterationPlayerId);
 
-          // Let's try to get PlayerMovementSystem to expose its yVelocity or make calculatePlayerMovement work for this.
-          // The current `calculatePlayerMovement` should be fine if we thread its output `newYVelocity` into the next input `currentYVelocity`.
-          
-          // Initial yVelocity for replay: if player on ground based on serverState.position, yVel=0. Otherwise, it's complicated.
-          // For now, we'll use a temporary yVelocity for the replay sequence. This is a simplification.
-          // We will assume that the `PlayerMovementSystem`'s own `yVelocity` is reset upon `toggleFlying` which might happen during replay of `F` key.
-          // The `calculatePlayerMovement` function takes `currentYVelocity`.
+            if (currentIterationPlayerId === this.currentServerPlayerId) {
+              // Local player update logic (remains largely the same, just sources data from accessors)
+              this.serverAuthoritativeIsGrounded = playerIsGrounded; // Triage Kit 1-A: Store it
+              this.movementControls.setServerGroundedState(this.serverAuthoritativeIsGrounded); // Triage Kit 1-A: Update movement system
+              
+              const serverPos = new THREE.Vector3(playerPosition.x(), playerPosition.y(), playerPosition.z());
+              const serverVel = new THREE.Vector3(playerVel.x(), playerVel.y(), playerVel.z()); // Get full server velocity vector
+              
+              const clientPredPos = new THREE.Vector3(
+                Transform.position.x[this.playerEntityId],
+                Transform.position.y[this.playerEntityId],
+                Transform.position.z[this.playerEntityId]
+              );
+              const clientPredYVel = this.movementControls.getCurrentYVelocity();
+              const clientPredHVel = this.movementControls.getCurrentHorizontalVelocity();
+              const clientPredIsFlying = this.movementControls.isFlying();
+              const clientPredIsOnGround = this.movementControls.isOnGround();
 
-          // Retrieve the Y velocity from the player entity after it's been snapped to server state.
-          // This relies on PlayerMovementSystem having updated it based on that snapped state in a previous frame, which is not true.
-          // This implies calculatePlayerMovement needs to be more self-contained or server must send yVelocity.
-          // For now, this will be a source of slight inaccuracy. We reset it to 0 for simplicity.
-          let yVelocityForReplay = 0; // Simplified: reset for replay sequence.
+              const predictionError = clientPredPos.distanceTo(serverPos);
+              const lastAckFromServer = playerState.lastAck();
 
-          for (const pending of this.pendingInputs) {
-            this.tempCurrentPosition.set(
-              Transform.position.x[this.playerEntityId],
-              Transform.position.y[this.playerEntityId],
-              Transform.position.z[this.playerEntityId]
-            );
-            const inputState: PlayerMovementInputState = {
-              currentPosition: this.tempCurrentPosition,
-              currentYVelocity: yVelocityForReplay, // Use the evolving yVelocityForReplay
-              currentIsFlying: pending.currentIsFlying,
-              cameraYaw: pending.cameraYaw,
-              keys: pending.keys,
-              deltaTime: pending.deltaTime,
-              chunkManager: this.chunkManager,
-            };
+              // Enhanced logging for significant prediction errors (potential rubber-band trigger)
+              if (predictionError > 0.1) { // Log if error is > 10cm
+                console.warn("---------------- SRV CORRECTION (Rubber Band?) ----------------");
+                console.log(`[NetMan Correction] Server Tick: ${snapshot.tick()}, Player ID: ${this.currentServerPlayerId}`);
+                console.log(`  SERVER Authoritative State:`);
+                console.log(`    Pos: {x: ${serverPos.x.toFixed(3)}, y: ${serverPos.y.toFixed(3)}, z: ${serverPos.z.toFixed(3)}}`);
+                console.log(`    Vel: {x: ${serverVel.x.toFixed(3)}, y: ${serverVel.y.toFixed(3)}, z: ${serverVel.z.toFixed(3)}}`);
+                console.log(`    isGrounded (Srv): ${playerIsGrounded}, lastAck (Srv): ${lastAckFromServer}`);
+                console.log(`  CLIENT Predicted State (before correction):`);
+                console.log(`    Pos: {x: ${clientPredPos.x.toFixed(3)}, y: ${clientPredPos.y.toFixed(3)}, z: ${clientPredPos.z.toFixed(3)}}`);
+                console.log(`    yVel (Cli): ${clientPredYVel.toFixed(3)}, hVel (Cli): {x: ${clientPredHVel.x.toFixed(3)}, z: ${clientPredHVel.y.toFixed(3)}}`);
+                console.log(`    isFlying (Cli): ${clientPredIsFlying}, isOnGround (Cli): ${clientPredIsOnGround}`);
+                console.log(`  DIAGNOSTICS:`);
+                console.log(`    Prediction Error: ${predictionError.toFixed(3)}m`);
+                console.log(`    Pending Inputs (seq numbers): [${this.pendingInputs.map(p => p.seq).join(', ')}]`);
+                console.warn("---------------- END SRV CORRECTION LOG ----------------");
+              }
+              // The old DLOG-1 throttle can be removed or kept if preferred for less critical errors
+              // this.snapshotErrorLogThrottle++;
+              // if (this.snapshotErrorLogThrottle >= 5 || predictionError > 0.1) { 
+              //   console.log(`[NetMan C4-1 PredictErr] ServerPos: (${serverPos.x.toFixed(2)}, ${serverPos.y.toFixed(2)}, ${serverPos.z.toFixed(2)}), ClientPred: (${clientPredPos.x.toFixed(2)}, ${clientPredPos.y.toFixed(2)}, ${clientPredPos.z.toFixed(2)}), Error: ${predictionError.toFixed(3)}m`);
+              //   this.snapshotErrorLogThrottle = 0; 
+              // }
 
-            const outputState = calculatePlayerMovement(inputState);
+              // Correction logic (snap or lerp)
+              if (predictionError > 2.0) { 
+                Transform.position.x[this.playerEntityId] = serverPos.x;
+                Transform.position.y[this.playerEntityId] = serverPos.y;
+                Transform.position.z[this.playerEntityId] = serverPos.z;
+              } else if (predictionError > 0.01) { // Only lerp if error is > 1cm to avoid micro-adjustments fighting prediction
+                const lerpFactor = predictionError > 0.5 ? 0.5 : 0.25; // Stronger lerp for larger errors
+                clientPredPos.lerp(serverPos, lerpFactor); 
+                Transform.position.x[this.playerEntityId] = clientPredPos.x;
+                Transform.position.y[this.playerEntityId] = clientPredPos.y;
+                Transform.position.z[this.playerEntityId] = clientPredPos.z;
+              }
+              
+              // Use playerState.lastAck() for sequence number processing
+              // const lastProcessed = playerState.lastAck(); // Already got this as lastAckFromServer
+              if (typeof lastAckFromServer === 'number') {
+                  this.localPlayerLastProcessedInputSeq = lastAckFromServer;
+                  this.pendingInputs = this.pendingInputs.filter(
+                      (input) => input.seq > this.localPlayerLastProcessedInputSeq
+                  );
+              }
 
-            Transform.position.x[this.playerEntityId] = outputState.newPosition.x;
-            Transform.position.y[this.playerEntityId] = outputState.newPosition.y;
-            Transform.position.z[this.playerEntityId] = outputState.newPosition.z;
-            yVelocityForReplay = outputState.newYVelocity; // Thread the yVelocity
-          }
+              // Prediction replay logic
+              const clientIsFlying = this.movementControls.isFlying(); 
 
-        } else if (data.type === 'blockUpdate') {
-          // Server confirmed a block change (e.g., after mining)
-          console.log('Received blockUpdate (RLE) from server:', data);
-          if (typeof data.chunkX === 'number' && typeof data.chunkZ === 'number' && Array.isArray(data.rleBytes)) {
-            // Ensure rleBytes contains numbers, as it comes from JSON
-            const numericRleBytes: number[] = data.rleBytes.filter((b: any) => typeof b === 'number');
-            if (numericRleBytes.length !== data.rleBytes.length) {
-                console.warn('NetworkManager: Received rleBytes with non-numeric values.', data.rleBytes);
-            }            
-            if (numericRleBytes.length > 0) {
-                this.chunkManager.applyRLEUpdate(data.chunkX, data.chunkZ, numericRleBytes)
-                    .catch(error => {
-                        console.error('Error applying RLE update to chunkManager:', error);
-                    });
-            } else if (data.rleBytes.length > 0) {
-                // This case means rleBytes was an array but all elements were non-numeric or it was filtered to empty
-                console.warn('NetworkManager: rleBytes received but resulted in empty numeric array after filtering.', data.rleBytes);
-            } else {
-                // rleBytes was genuinely empty array, could be valid if server can send empty diffs.
-                console.log('NetworkManager: Received empty rleBytes array for blockUpdate. No changes to apply.');
+              // N1-2: Replay Gating Condition
+              // Triage Kit 1-A: Use serverAuthoritativeIsGrounded for replay decisions
+              if ((this.serverAuthoritativeIsGrounded || clientIsFlying) && !(this.serverAuthoritativeIsGrounded && predictionError < 0.3)) {
+                let yVelocityForReplay: number;
+                let horizontalVelocityForReplay: THREE.Vector2 = new THREE.Vector2(); // Initialize
+
+                // N1-1: Initialize replay velocities from server snapshot
+                yVelocityForReplay = playerVel.y();
+                horizontalVelocityForReplay.set(playerVel.x(), playerVel.z());
+                
+                // console.log(`[NetMan N1-1 ReplayStart] ServerVel Y: ${playerVel.y().toFixed(2)}, XZ: (${playerVel.x().toFixed(2)}, ${playerVel.z().toFixed(2)})`);
+
+                // The old way of getting yVelocityForReplay:
+                // if (clientIsFlying) {
+                //   yVelocityForReplay = 0;
+                // } else {
+                //   yVelocityForReplay = this.movementControls.getCurrentYVelocity(); 
+                // }
+                // And horizontalVelocityForReplay was initialized from this.movementControls.getCurrentHorizontalVelocity() before the loop
+
+                this.pendingInputs.forEach((input) => {
+                  for (let i = 0; i < input.numFixedTicks; i++) {
+                    const tempCurrentPosition = new THREE.Vector3(
+                      Transform.position.x[this.playerEntityId],
+                      Transform.position.y[this.playerEntityId],
+                      Transform.position.z[this.playerEntityId]
+                    );
+                    const inputState: PlayerMovementInputState = {
+                      currentPosition: tempCurrentPosition,
+                      currentHorizontalVelocity: horizontalVelocityForReplay.clone(), // C1-1 Fix: Use and pass hVel for replay
+                      currentYVelocity: yVelocityForReplay, 
+                      currentIsFlying: input.currentIsFlying,
+                      cameraYaw: input.cameraYaw, 
+                      keys: input.keys,
+                      chunkManager: this.chunkManager,
+                      getIsOnGround: () => this.movementControls.isOnGround(), // Added to resolve TS error
+                    };
+                    const outputState = calculatePlayerMovement(inputState); 
+                    Transform.position.x[this.playerEntityId] = outputState.newPosition.x;
+                    Transform.position.z[this.playerEntityId] = outputState.newPosition.z;
+                    // Always apply the re-calculated Y position during replay
+                    // This ensures the client's re-simulation fully updates its local Y
+                    // before server state correction.
+                    Transform.position.y[this.playerEntityId] = outputState.newPosition.y;
+                    yVelocityForReplay = outputState.newYVelocity; 
+                    horizontalVelocityForReplay.copy(outputState.horizontalVelocity); // C1-1 Fix: Update hVel for next replay step
+                  }
+                });
+              } else if (this.serverAuthoritativeIsGrounded && predictionError < 0.3) {
+                // console.log(`[NetMan N1-2 ReplaySkip] OnGround: ${this.serverAuthoritativeIsGrounded}, Error: ${predictionError.toFixed(3)}m. Skipping replay.`);
+              }
+            } else { // Remote player update logic
+              let remoteEntityId = this.remotePlayerEntities.get(currentIterationPlayerId);
+              const remotePlayerPos = playerState.position();
+              // console.log(`[NetMan Debug] Remote player ${currentIterationPlayerId}: Server pos (${remotePlayerPos?.x().toFixed(2)}, ${remotePlayerPos?.y().toFixed(2)}, ${remotePlayerPos?.z().toFixed(2)})`);
+              if (!remoteEntityId) {
+                remoteEntityId = addEntity(this.world);
+                addComponent(this.world, Transform, remoteEntityId);
+                addComponent(this.world, Object3DRef, remoteEntityId);
+                this.remotePlayerEntities.set(currentIterationPlayerId, remoteEntityId);
+                // console.log(`[NetMan Debug] Remote player ${currentIterationPlayerId}: Created new entity ${remoteEntityId}`);
+                if (this.scene && remotePlayerPos) {
+                  const geometry = new THREE.CapsuleGeometry(0.4, 1.8 - 0.8, 4, 8);
+                  const material = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+                  const model = new THREE.Mesh(geometry, material);
+                  this.scene.add(model);
+                  object3DMap.set(remoteEntityId, model);
+                  this.remotePlayerModels.set(currentIterationPlayerId, model);
+                  // console.log(`[NetMan Debug] Remote player ${currentIterationPlayerId}: Added 3D model to scene.`);
+                }
+              } 
+              if (remotePlayerPos) {
+                Transform.position.x[remoteEntityId] = remotePlayerPos.x();
+                Transform.position.y[remoteEntityId] = remotePlayerPos.y(); 
+                Transform.position.z[remoteEntityId] = remotePlayerPos.z();
+              }
+              // console.log(`[NetMan Debug] Remote player ${currentIterationPlayerId} (entity ${remoteEntityId}): Updated Transform to (${Transform.position.x[remoteEntityId].toFixed(2)}, ${Transform.position.y[remoteEntityId].toFixed(2)}, ${Transform.position.z[remoteEntityId].toFixed(2)})`);
             }
-          } else {
-            console.warn('NetworkManager: Received malformed blockUpdate message (RLE expected):', data);
           }
-        } else if (data.type === 'mineError') {
-          // Server sent a mining error
-          console.error(`Mine Error (seq: ${data.seq}, code: ${data.code}): ${data.reason}`);
-          // Potentially alert the user or revert optimistic updates if we add them later
-        } else if (data.type === 'placeError') {
-          console.error(`Place Error (seq: ${data.seq}, code: ${data.code}): ${data.reason}`);
-          // Potentially alert the user or revert optimistic updates
-        } else if (data.type === 'stateUpdate') { // For other entities, if ever needed
-          // Handle other entities if needed
+          this.remotePlayerEntities.forEach((entityId, playerId) => {
+            if (!serverPlayerIds.has(playerId)) {
+              if (hasComponent(this.world, Object3DRef, entityId)) {
+                  const model = object3DMap.get(entityId) as THREE.Mesh; // Cast to THREE.Mesh
+                  if (model && this.scene) {
+                      this.scene.remove(model);
+                      if (model.geometry) model.geometry.dispose();
+                      if (model.material && typeof (model.material as THREE.Material).dispose === 'function') {
+                          (model.material as THREE.Material).dispose();
+                      }
+                  }
+                  object3DMap.delete(entityId);
+              }
+              removeEntity(this.world, entityId);
+              this.remotePlayerEntities.delete(playerId);
+              this.remotePlayerModels.delete(playerId);
+            }
+          });
+        } catch (error) {
+          console.error('[NetworkManager] Error decoding FlatBuffer ServerSnapshot:', error, data);
         }
-      } catch (error) {
-        console.error('Error handling server message:', error);
+      } else {
+        console.warn('[NetworkManager] Received message of unknown type:', data);
       }
     };
   }
 
   public connect(): void {
     this.wsClient.connect();
-    this.startCommandLoop();
+  }
+
+  private handleServerMessage(message: any): void {
+    // Handle JSON messages (init, chunk responses, block updates, errors, playerLeft)
+    if (this.chunkManager) {
+      if (message.type === 'chunkResponse') {
+        if (typeof message.cx === 'number' && typeof message.cz === 'number' && Array.isArray(message.voxels)) {
+          this.chunkManager.handleChunkResponse(message.cx, message.cz, message.voxels.filter((v: any) => typeof v === 'number'));
+        } else { console.warn('[NetworkManager] Malformed chunkResponse:', message); }
+        return;
+      } else if (message.type === 'chunkResponseError') {
+        if (typeof message.cx === 'number' && typeof message.cz === 'number' && typeof message.reason === 'string') {
+          this.chunkManager.handleChunkResponseError(message.cx, message.cz, message.reason);
+        } else { console.warn('[NetworkManager] Malformed chunkResponseError:', message); }
+        return;
+      }
+    }
+
+    switch (message.type) {
+      case 'init':
+        this.currentServerPlayerId = message.playerId;
+        console.log(`[NetworkManager] Player initialized with ID: ${this.currentServerPlayerId}`);
+        if (message.initialPos && this.currentServerPlayerId === message.playerId) {
+            Transform.position.x[this.playerEntityId] = message.initialPos.x;
+            Transform.position.y[this.playerEntityId] = message.initialPos.y;
+            Transform.position.z[this.playerEntityId] = message.initialPos.z;
+            console.log(`[NetworkManager] Local player initial position set from server: (${message.initialPos.x}, ${message.initialPos.y}, ${message.initialPos.z})`);
+        }
+
+        if (message.state && message.state.players) {
+          for (const playerIdVal in message.state.players) { // Use different var name from outer scope
+            if (playerIdVal === this.currentServerPlayerId) continue;
+            const pData = message.state.players[playerIdVal];
+            if (pData && pData.id && pData.position) {
+              let remoteEntityId = this.remotePlayerEntities.get(pData.id);
+              if (!remoteEntityId) {
+                remoteEntityId = addEntity(this.world);
+                addComponent(this.world, Transform, remoteEntityId);
+                addComponent(this.world, Object3DRef, remoteEntityId);
+                this.remotePlayerEntities.set(pData.id, remoteEntityId);
+                if (this.scene) {
+                    const geometry = new THREE.CapsuleGeometry(0.4, 1.8 - 0.8, 4, 8);
+                    const material = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+                    const model = new THREE.Mesh(geometry, material);
+                    model.position.set(pData.position.x, pData.position.y + (1.8/2) - 0.4, pData.position.z);
+                    this.scene.add(model); 
+                    object3DMap.set(remoteEntityId, model);
+                    this.remotePlayerModels.set(pData.id, model);
+                }
+              }
+              Transform.position.x[remoteEntityId] = pData.position.x;
+              Transform.position.y[remoteEntityId] = pData.position.y;
+              Transform.position.z[remoteEntityId] = pData.position.z;
+            }
+          }
+        }
+        if (this.onServerInitialized) {
+          this.onServerInitialized();
+        }
+        break;
+      case 'blockUpdate':
+        if (typeof message.chunkX === 'number' && typeof message.chunkZ === 'number' && Array.isArray(message.rleBytes)) {
+          const numericRleBytes: number[] = message.rleBytes.filter((b: any) => typeof b === 'number');
+          if (numericRleBytes.length > 0) {
+              this.chunkManager.applyRLEUpdate(message.chunkX, message.chunkZ, numericRleBytes)
+                  .catch(error => console.error('[NetworkManager] Error applying RLE update:', error));
+          }
+        } else { console.warn('[NetworkManager] Malformed blockUpdate:', message); }
+        break;
+      case 'mineError':
+      case 'placeError':
+        console.error(`[NetworkManager] ${message.type} (seq: ${message.seq}, code: ${message.code}): ${message.reason}`);
+        break;
+      case 'playerLeft':
+        const entityToRemove = this.remotePlayerEntities.get(message.playerId);
+        if (entityToRemove) {
+          if (hasComponent(this.world, Object3DRef, entityToRemove)) {
+            const model = object3DMap.get(entityToRemove) as THREE.Mesh; // Cast to THREE.Mesh
+            if (model && this.scene) {
+                this.scene.remove(model);
+                if (model.geometry) model.geometry.dispose();
+                if (model.material && typeof (model.material as THREE.Material).dispose === 'function') {
+                    (model.material as THREE.Material).dispose();
+                }
+            }
+            object3DMap.delete(entityToRemove);
+          }
+          removeEntity(this.world, entityToRemove);
+          this.remotePlayerEntities.delete(message.playerId);
+          this.remotePlayerModels.delete(message.playerId);
+          console.log(`[NetworkManager] Removed entity and model for player ${message.playerId}`);
+        }
+        break;
+      default:
+        // console.warn('[NetworkManager] Unhandled JSON message type:', message.type);
+    }
+  }
+
+  // For sending JSON commands like MINE_BLOCK, PLACE_BLOCK
+  public sendJsonCommand(type: ClientCommandType, payload: any = {}): void {
+    if (!this.wsClient) return;
+    this.lastSentInputSeq++; // Increment for any command sent for now
+    const command: ClientCommand = { // This is the local ClientCommand type from ./types
+      commandType: type,
+      seq: this.lastSentInputSeq, // Include sequence number
+      ...payload,
+    };
+    // Ensure this.wsClient.sendCommand stringifies the command
+    this.wsClient.sendCommand(command); 
+  }
+  
+  // Specific methods for mine/place to ensure correct payload structure
+  public sendMineCommand(voxelX: number, voxelY: number, voxelZ: number): void {
+    this.sendJsonCommand(ClientCommandType.MINE_BLOCK, { targetVoxelX: voxelX, targetVoxelY: voxelY, targetVoxelZ: voxelZ });
+  }
+
+  public sendPlaceCommand(voxelX: number, voxelY: number, voxelZ: number, blockId: number): void {
+    this.sendJsonCommand(ClientCommandType.PLACE_BLOCK, { targetVoxelX: voxelX, targetVoxelY: voxelY, targetVoxelZ: voxelZ, blockId: blockId });
+  }
+
+
+  public startCommandLoop(): void {
+    if (this.commandLoopInterval !== null) return;
+    this.commandLoopInterval = window.setInterval(() => {
+      const playerIdForCommand = this.currentServerPlayerId; // Used for logging, server extracts ID from connection
+
+      if (!this.wsClient || !this.movementControls || this.wsClient.getSocket()?.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      const currentKeys = this.movementControls.getKeyStates();
+      // this.inputHandler.resetMouseDelta(); // mouseDeltaX is no longer used for PlayerInput's yaw
+
+      // M1-1: Get necessary states for PlayerInput
+      const currentAbsoluteCameraYaw = CameraTarget.yaw[this.playerEntityId];
+      const currentIsFlying = this.movementControls.isFlying();
+      const jumpPressed = currentKeys['Space'] || false;
+      const flyDownPressed = (currentKeys['ShiftLeft'] || currentKeys['ControlLeft']) || false; // Added
+
+      // M1-1: Calculate movementIntent
+      const intent = new THREE.Vector3();
+      if (currentKeys['KeyW'] || currentKeys['ArrowUp']) intent.z -= 1;
+      if (currentKeys['KeyS'] || currentKeys['ArrowDown']) intent.z += 1;
+      if (currentKeys['KeyA'] || currentKeys['ArrowLeft']) intent.x -= 1;
+      if (currentKeys['KeyD'] || currentKeys['ArrowRight']) intent.x += 1;
+
+      // Normalize if necessary (to prevent faster diagonal movement)
+      if (intent.lengthSq() > 1) {
+        intent.normalize();
+      }
+
+      // M1-1: Send PlayerInput every tick (removed previous shouldSend optimization for now)
+      this.lastSentInputSeq++;
+      const fbBuilder = new flatbuffers.Builder(128);
+      
+      const movementIntentOffset = FbVec3.createVec3(fbBuilder, intent.x, intent.y, intent.z);
+
+      PlayerInput.startPlayerInput(fbBuilder);
+      PlayerInput.addSeq(fbBuilder, this.lastSentInputSeq);
+      PlayerInput.addMovementIntent(fbBuilder, movementIntentOffset);
+      PlayerInput.addYaw(fbBuilder, currentAbsoluteCameraYaw);
+      PlayerInput.addJumpPressed(fbBuilder, jumpPressed);
+      PlayerInput.addFlyDownPressed(fbBuilder, flyDownPressed); // Added
+      PlayerInput.addIsFlying(fbBuilder, currentIsFlying);
+      
+      const cmdOffset = PlayerInput.endPlayerInput(fbBuilder);
+      fbBuilder.finish(cmdOffset);
+      const commandPayload = fbBuilder.asUint8Array();
+
+      // console.log(`[Client Sent PlayerInput] Seq: ${this.lastSentInputSeq}, Yaw: ${currentAbsoluteCameraYaw.toFixed(2)}, Intent: (${intent.x},${intent.y},${intent.z})`);
+
+      this.wsClient.sendBinaryCommand(commandPayload); 
+      // this.lastSentPlayerInputState = currentStateForCompare; // Removed as PlayerInputStateForCompare is removed
+
+      // Pending inputs still use individual key states and cameraYaw for client-side prediction
+      // This is fine as calculatePlayerMovement can derive direction from these.
+      this.pendingInputs.push({
+        seq: this.lastSentInputSeq,
+        // deltaTime: 1 / 30, // Removed for C4-1
+        numFixedTicks: Math.round((1/30) / FIXED_DT_S), // C4-1: Calculate based on command loop rate and fixed DT
+        cameraYaw: currentAbsoluteCameraYaw, 
+        currentIsFlying: currentIsFlying, // Store isFlying at time of input
+        keys: { ...currentKeys }, // Keep raw keys for prediction system
+        currentHorizontalVelocity: this.movementControls.getCurrentHorizontalVelocity(), // C1-1 Fix: Store hVel in PendingInput
+      });
+    }, 1000 / 30); // Send at 30Hz
+  }
+
+  public stopCommandLoop(): void {
+    if (this.commandLoopInterval !== null) {
+      clearInterval(this.commandLoopInterval);
+      this.commandLoopInterval = null;
+    }
   }
 
   public disconnect(): void {
     this.stopCommandLoop();
-    this.wsClient.disconnect();
-  }
-
-  // New method to send a mine command
-  public sendMineCommand(voxelX: number, voxelY: number, voxelZ: number): void {
-    this.clientInputSequenceNumber++;
-    const command: ClientCommand = {
-      commandType: ClientCommandType.MINE_BLOCK,
-      seq: this.clientInputSequenceNumber,
-      timestamp: Date.now(),
-      targetVoxelX: voxelX,
-      targetVoxelY: voxelY,
-      targetVoxelZ: voxelZ,
-    };
-    this.wsClient.sendCommand(command);
-    console.log('Sent MineBlockCommand:', command); 
-  }
-
-  public sendPlaceCommand(voxelX: number, voxelY: number, voxelZ: number, blockId: number): void {
-    this.clientInputSequenceNumber++;
-    const command: ClientCommand = {
-      commandType: ClientCommandType.PLACE_BLOCK,
-      seq: this.clientInputSequenceNumber,
-      timestamp: Date.now(),
-      targetVoxelX: voxelX,
-      targetVoxelY: voxelY,
-      targetVoxelZ: voxelZ,
-      blockId: blockId,
-    };
-    this.wsClient.sendCommand(command);
-    console.log('Sent PlaceBlockCommand:', command);
-  }
-
-  private startCommandLoop(): void {
-    if (this.commandInterval) return;
-
-    this.commandInterval = window.setInterval(() => {
-      const inputHandlerCommand = this.inputHandler.getCommand();
-      this.clientInputSequenceNumber++;
-      const deltaTime = 1 / this.COMMAND_RATE; // Still needed for pending inputs if we decide to keep them separate
-
-      const currentKeys = this.movementSystemControls.getKeyStates();
-      const currentCameraYaw = CameraTarget.yaw[this.playerEntityId];
-      const flyingStatus = this.movementSystemControls.isFlying();
-
-      const playerInputCommand: ClientCommand = {
-        commandType: ClientCommandType.PLAYER_INPUT,
-        seq: this.clientInputSequenceNumber,
-        timestamp: inputHandlerCommand.timestamp,
-        moveForward: !!currentKeys['KeyW'] || !!currentKeys['ArrowUp'],
-        moveBackward: !!currentKeys['KeyS'] || !!currentKeys['ArrowDown'],
-        moveLeft: !!currentKeys['KeyA'] || !!currentKeys['ArrowLeft'],
-        moveRight: !!currentKeys['KeyD'] || !!currentKeys['ArrowRight'],
-        jump: !!currentKeys['Space'],
-        descend: !!currentKeys['ShiftLeft'] || !!currentKeys['ControlLeft'],
-        mouseDeltaX: inputHandlerCommand.mouseDeltaX || 0,
-        mouseDeltaY: inputHandlerCommand.mouseDeltaY || 0,
-      };
-
-      // Check for active input before sending and adding to pending inputs
-      const hasKeyMovement = playerInputCommand.moveForward || playerInputCommand.moveBackward || 
-                             playerInputCommand.moveLeft || playerInputCommand.moveRight || 
-                             playerInputCommand.jump || playerInputCommand.descend;
-      const hasMouseMovement = playerInputCommand.mouseDeltaX !== 0 || playerInputCommand.mouseDeltaY !== 0;
-
-      if (hasKeyMovement || hasMouseMovement) {
-        this.pendingInputs.push({
-          seq: this.clientInputSequenceNumber,
-          keys: currentKeys, 
-          cameraYaw: currentCameraYaw,
-          currentIsFlying: flyingStatus,
-          deltaTime: deltaTime, // deltaTime is for replaying this input
-          rawCommand: playerInputCommand, 
-        });
-        this.wsClient.sendCommand(playerInputCommand);
-      } else {
-        // If no active input, we still need to reset mouse delta from inputHandler for the next frame.
-        // However, we don't send a command or add to pending inputs if player is truly idle.
-        // This is a simplification; a more robust system might send periodic idle updates
-        // or always send input and have server ignore no-ops.
-      }
-      this.inputHandler.resetMouseDelta(); // Always reset delta from input handler
-
-    }, 1000 / this.COMMAND_RATE);
-  }
-
-  private stopCommandLoop(): void {
-    if (this.commandInterval) {
-      clearInterval(this.commandInterval);
-      this.commandInterval = null;
+    if (this.wsClient) {
+      this.wsClient.disconnect();
     }
   }
 } 

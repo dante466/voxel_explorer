@@ -10,7 +10,7 @@ import type { ChunkManager } from '../../world/ChunkManager';
 
 // Constants from the spec
 export const TPS_DEFAULT_PITCH_RAD = THREE.MathUtils.degToRad(-20);
-export const FPS_EYE_HEIGHT = 1.6;
+export const FPS_EYE_HEIGHT = 0.7;
 export const DEFAULT_ZOOM = 3;
 export const ZOOM_MIN = 1;
 export const ZOOM_MAX = 10;

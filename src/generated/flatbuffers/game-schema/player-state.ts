@@ -37,18 +37,33 @@ position(obj?:Vec3):Vec3|null {
   return offset ? (obj || new Vec3()).__init(this.bb!.__indirect(this.bb_pos + offset), this.bb!) : null;
 }
 
-rotation(obj?:Vec3):Vec3|null {
+vel(obj?:Vec3):Vec3|null {
   const offset = this.bb!.__offset(this.bb_pos, 8);
   return offset ? (obj || new Vec3()).__init(this.bb!.__indirect(this.bb_pos + offset), this.bb!) : null;
 }
 
-lastProcessedInputSeq():number {
+yaw():number {
   const offset = this.bb!.__offset(this.bb_pos, 10);
-  return offset ? this.bb!.readInt32(this.bb_pos + offset) : 0;
+  return offset ? this.bb!.readFloat32(this.bb_pos + offset) : 0.0;
+}
+
+lastAck():number {
+  const offset = this.bb!.__offset(this.bb_pos, 12);
+  return offset ? this.bb!.readUint32(this.bb_pos + offset) : 0;
+}
+
+isFlying():boolean {
+  const offset = this.bb!.__offset(this.bb_pos, 14);
+  return offset ? !!this.bb!.readInt8(this.bb_pos + offset) : false;
+}
+
+isGrounded():boolean {
+  const offset = this.bb!.__offset(this.bb_pos, 16);
+  return offset ? !!this.bb!.readInt8(this.bb_pos + offset) : false;
 }
 
 static startPlayerState(builder:flatbuffers.Builder) {
-  builder.startObject(4);
+  builder.startObject(7);
 }
 
 static addId(builder:flatbuffers.Builder, idOffset:flatbuffers.Offset) {
@@ -59,12 +74,24 @@ static addPosition(builder:flatbuffers.Builder, positionOffset:flatbuffers.Offse
   builder.addFieldOffset(1, positionOffset, 0);
 }
 
-static addRotation(builder:flatbuffers.Builder, rotationOffset:flatbuffers.Offset) {
-  builder.addFieldOffset(2, rotationOffset, 0);
+static addVel(builder:flatbuffers.Builder, velOffset:flatbuffers.Offset) {
+  builder.addFieldOffset(2, velOffset, 0);
 }
 
-static addLastProcessedInputSeq(builder:flatbuffers.Builder, lastProcessedInputSeq:number) {
-  builder.addFieldInt32(3, lastProcessedInputSeq, 0);
+static addYaw(builder:flatbuffers.Builder, yaw:number) {
+  builder.addFieldFloat32(3, yaw, 0.0);
+}
+
+static addLastAck(builder:flatbuffers.Builder, lastAck:number) {
+  builder.addFieldInt32(4, lastAck, 0);
+}
+
+static addIsFlying(builder:flatbuffers.Builder, isFlying:boolean) {
+  builder.addFieldInt8(5, +isFlying, +false);
+}
+
+static addIsGrounded(builder:flatbuffers.Builder, isGrounded:boolean) {
+  builder.addFieldInt8(6, +isGrounded, +false);
 }
 
 static endPlayerState(builder:flatbuffers.Builder):flatbuffers.Offset {
@@ -78,8 +105,11 @@ unpack(): PlayerStateT {
   return new PlayerStateT(
     this.id(),
     (this.position() !== null ? this.position()!.unpack() : null),
-    (this.rotation() !== null ? this.rotation()!.unpack() : null),
-    this.lastProcessedInputSeq()
+    (this.vel() !== null ? this.vel()!.unpack() : null),
+    this.yaw(),
+    this.lastAck(),
+    this.isFlying(),
+    this.isGrounded()
   );
 }
 
@@ -87,8 +117,11 @@ unpack(): PlayerStateT {
 unpackTo(_o: PlayerStateT): void {
   _o.id = this.id();
   _o.position = (this.position() !== null ? this.position()!.unpack() : null);
-  _o.rotation = (this.rotation() !== null ? this.rotation()!.unpack() : null);
-  _o.lastProcessedInputSeq = this.lastProcessedInputSeq();
+  _o.vel = (this.vel() !== null ? this.vel()!.unpack() : null);
+  _o.yaw = this.yaw();
+  _o.lastAck = this.lastAck();
+  _o.isFlying = this.isFlying();
+  _o.isGrounded = this.isGrounded();
 }
 }
 
@@ -96,21 +129,27 @@ export class PlayerStateT implements flatbuffers.IGeneratedObject {
 constructor(
   public id: string|Uint8Array|null = null,
   public position: Vec3T|null = null,
-  public rotation: Vec3T|null = null,
-  public lastProcessedInputSeq: number = 0
+  public vel: Vec3T|null = null,
+  public yaw: number = 0.0,
+  public lastAck: number = 0,
+  public isFlying: boolean = false,
+  public isGrounded: boolean = false
 ){}
 
 
 pack(builder:flatbuffers.Builder): flatbuffers.Offset {
   const id = (this.id !== null ? builder.createString(this.id!) : 0);
   const position = (this.position !== null ? this.position!.pack(builder) : 0);
-  const rotation = (this.rotation !== null ? this.rotation!.pack(builder) : 0);
+  const vel = (this.vel !== null ? this.vel!.pack(builder) : 0);
 
   PlayerState.startPlayerState(builder);
   PlayerState.addId(builder, id);
   PlayerState.addPosition(builder, position);
-  PlayerState.addRotation(builder, rotation);
-  PlayerState.addLastProcessedInputSeq(builder, this.lastProcessedInputSeq);
+  PlayerState.addVel(builder, vel);
+  PlayerState.addYaw(builder, this.yaw);
+  PlayerState.addLastAck(builder, this.lastAck);
+  PlayerState.addIsFlying(builder, this.isFlying);
+  PlayerState.addIsGrounded(builder, this.isGrounded);
 
   return PlayerState.endPlayerState(builder);
 }

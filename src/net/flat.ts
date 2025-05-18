@@ -1,38 +1,56 @@
 import * as flatbuffers from 'flatbuffers';
-import { StateSnapshot, PlayerStateT, Vec3T } from '../generated/flatbuffers/game-schema'; // Adjusted for Object API
+import { ServerSnapshot, PlayerState, Vec3 } from '../generated/flatbuffers/game-schema'; 
+
+// Define a simple interface for the player data structure expected by the encoder
+export interface PlayerData {
+  id: string;
+  position: { x: number; y: number; z: number };
+  vel: { x: number; y: number; z: number };
+  yaw: number;
+  lastAck: number;
+  isFlying: boolean;
+  isGrounded: boolean;
+}
 
 // Removed old helper functions as the new pattern uses Object API or direct construction
 
 // From Triage Kit Step 4
-export function encodeStateSnapshot(
+export function encodeServerSnapshot(
   builder: flatbuffers.Builder,
-  stamp: bigint,
-  players: readonly PlayerStateT[] // Using PlayerStateT from Object API
+  tick: number,
+  playersData: readonly PlayerData[]
 ): Uint8Array {
-  builder.clear(); // Clear builder state for fresh encoding
+  builder.clear();
 
-  // 1. Vec<Player>
-  const playerOffsets = players.map(p => p.pack(builder)); // Use .pack() from Object API
+  const playerOffsets = playersData.map(p => {
+    const idOffset = builder.createString(p.id);
+    const posOffset = Vec3.createVec3(builder, p.position.x, p.position.y, p.position.z);
+    const velOffset = Vec3.createVec3(builder, p.vel.x, p.vel.y, p.vel.z);
+
+    PlayerState.startPlayerState(builder);
+    PlayerState.addId(builder, idOffset);
+    PlayerState.addPosition(builder, posOffset);
+    PlayerState.addVel(builder, velOffset);
+    PlayerState.addYaw(builder, p.yaw);
+    PlayerState.addLastAck(builder, p.lastAck);
+    PlayerState.addIsFlying(builder, p.isFlying);
+    PlayerState.addIsGrounded(builder, p.isGrounded);
+    return PlayerState.endPlayerState(builder);
+  });
   
-  // Create the vector in reverse order as per FlatBuffers requirement
-  StateSnapshot.startPlayersVector(builder, players.length);
-  for (let i = players.length - 1; i >= 0; i--) {
-    builder.addOffset(playerOffsets[i]!);
-  }
-  const playersVec = builder.endVector();
+  const playersVectorOffset = ServerSnapshot.createPlayersVector(builder, playerOffsets);
 
-  // 2. Table
-  StateSnapshot.startStateSnapshot(builder);
-  StateSnapshot.addTimestamp(builder, stamp);        
-  StateSnapshot.addPlayers(builder, playersVec);
-  const root = StateSnapshot.endStateSnapshot(builder);
+  ServerSnapshot.startServerSnapshot(builder);
+  ServerSnapshot.addTick(builder, tick);        
+  ServerSnapshot.addPlayers(builder, playersVectorOffset);
+  const root = ServerSnapshot.endServerSnapshot(builder);
 
   builder.finish(root);
-  return builder.asUint8Array(); // asUint8Array() is preferred for clarity
+  return builder.asUint8Array();
 }
 
-export function decodeStateSnapshot(buf: Uint8Array): StateSnapshot {
-  return StateSnapshot.getRootAsStateSnapshot(new flatbuffers.ByteBuffer(buf));
+export function decodeServerSnapshot(buf: Uint8Array): ServerSnapshot {
+  return ServerSnapshot.getRootAsServerSnapshot(new flatbuffers.ByteBuffer(buf));
 }
 
 // --- Jest Test --- (Place this in a .test.ts file if you prefer, e.g., src/net/flat.test.ts)

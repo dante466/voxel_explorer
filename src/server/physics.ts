@@ -22,6 +22,7 @@ export async function initRapier() {
 export function createPhysicsWorld(): PhysicsWorld {
   const gravity = { x: 0.0, y: -9.81, z: 0.0 };
   const world = new rapier.World(gravity);
+  world.integrationParameters.dt = 1.0 / 30.0;
 
   return {
     raw: world,

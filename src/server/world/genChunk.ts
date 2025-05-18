@@ -7,6 +7,7 @@ import { makeHeightFn } from './heightAt.js';
 export function genChunk(seed: number, cx: number, cz: number) {
   const heightFn = makeHeightFn(seed);
   const voxels = new Uint8Array(CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z);
+  const heightmap = new Uint8Array(CHUNK_SIZE_X * CHUNK_SIZE_Z);
 
   for (let lx = 0; lx < CHUNK_SIZE_X; lx++) {
     for (let lz = 0; lz < CHUNK_SIZE_Z; lz++) {
@@ -14,6 +15,7 @@ export function genChunk(seed: number, cx: number, cz: number) {
       const wz = cz * CHUNK_SIZE_Z + lz;
 
       const h = heightFn(wx, wz);
+      heightmap[lz * CHUNK_SIZE_X + lx] = h;
 
       for (let y = 0; y < CHUNK_SIZE_Y; y++) {
         const idx = (y * CHUNK_SIZE_X * CHUNK_SIZE_Z) + (lz * CHUNK_SIZE_X) + lx;
@@ -28,5 +30,5 @@ export function genChunk(seed: number, cx: number, cz: number) {
     }
   }
 
-  return { voxels, lastModified: Date.now() };
+  return { voxels, heightmap, lastModified: Date.now() };
 } 

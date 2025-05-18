@@ -11,20 +11,37 @@ table Vec3 {
 
 // Represents the state of a single player
 table PlayerState {
-  id:string (key); // Player's unique identifier
-  position:Vec3;   // Player's current position
-  rotation:Vec3;   // Player's current rotation (can be Euler angles or quaternion components based on client use)
-  lastProcessedInputSeq:int; // Last input sequence number processed by the server for this player
+  id:string (key);             // Player's unique identifier
+  position:Vec3;               // Player's current position
+  vel:Vec3;                    // Player's current linear velocity
+  yaw:float;                   // Player's current absolute yaw (viewing direction)
+  lastAck:uint;                // Last input sequence number ACKNOWLEDGED by the server for this player
+  isFlying:bool;               // Is the player currently in fly mode
+  isGrounded:bool;             // Whether the server considers the player to be grounded
 }
 
 // Represents a snapshot of the game state, primarily player states
 // This will be the root type for network messages containing full state updates.
-table StateSnapshot {
-  players:[PlayerState]; // A list of all players currently in the game
-  timestamp:long;        // Server timestamp when this snapshot was generated
+table ServerSnapshot {
+  tick:uint;                  // Server tick number for this snapshot
+  players:[PlayerState];      // A list of all players currently in the game
 }
 
 // Optionally, you might want a root type for messages if you send different kinds of root tables
-// For now, we can assume StateSnapshot is often a root, or specific command types.
-// Let's define StateSnapshot as a root type for this example.
-root_type StateSnapshot; 
+// For now, we can assume ServerSnapshot is often a root, or specific command types.
+// Let's define ServerSnapshot as a root type for this example.
+root_type ServerSnapshot;
+
+// M0-1: PlayerInput from Client to Server
+// Renamed from ClientCommand, added yaw, movementIntent, specific action flags
+table PlayerInput {
+  seq:uint;                   // Sequence number for this input
+  movementIntent:Vec3;        // Normalized XZ, Y is 0. Represents W/A/S/D style input.
+  yaw:float;                  // Player's absolute current yaw (viewing direction)
+  jumpPressed:bool;           // True if jump was pressed this tick
+  flyDownPressed:bool;         // Added for authoritative fly-down
+  isFlying:bool;              // Current flying state (matches player's state when input was generated)
+  // shoot:bool;              // Example for another action, can be added if needed
+}
+
+root_type PlayerInput; 

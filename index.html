@@ -14,16 +14,48 @@
         left: 0;
         width: 100%;
         height: 100%;
-        background-color: rgba(0,0,0,0.8);
+        background-color: black;
         display: flex;
         justify-content: center;
         align-items: center;
         z-index: 9999;
         color: white;
         font-size: 5em; /* Increased smiley size */
+        opacity: 1;
+        transform: scale(1);
       }
+
+      /* Updated class to trigger the keyframe animation */
+      #loading-overlay.hidden {
+        /* opacity: 0; */ /* Handled by animation */
+        /* transform: scale(0.5) rotate(45deg); */ /* Handled by animation */
+        animation-name: shrinkPopHide;
+        animation-duration: 0.9s; /* e.g., 0.9 seconds */
+        animation-timing-function: ease-out;
+        animation-fill-mode: forwards; /* Retain state of the last keyframe */
+      }
+
+      @keyframes shrinkPopHide {
+        0% {
+          opacity: 1;
+          transform: scale(1);
+        }
+        60% { /* Shrink to 45% */
+          opacity: 1;
+          transform: scale(0.45);
+        }
+        80% { /* Slight pop and start fade */
+          opacity: 0.5;
+          transform: scale(0.50);
+        }
+        100% { /* Disappear */
+          opacity: 0;
+          transform: scale(0);
+        }
+      }
+
       .smiley {
-        animation: spin 2s linear infinite;
+        animation: spin 1s linear infinite;
       }
       @keyframes spin {
         0% { transform: rotate(0deg); }
