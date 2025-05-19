@@ -3,8 +3,9 @@ import { WebSocketServer, WebSocket as ServerWebSocket } from 'ws';
 import { addEntity, addComponent, removeEntity } from 'bitecs';
 import { createServerECSWorld, Position, Rotation, Velocity, NetworkId, type ServerECSWorld } from './ecs/world.js';
 import { createPhysicsWorld, initRapier } from './physics.js';
-import type { MatchState as IMatchState, PlayerServer, Chunk } from './types.js'; // Renamed to avoid conflict
-import { ClientCommandType } from './types.js';
+import type { MatchState as IMatchState } from './types.js'; // MatchState from here
+import { ClientCommandType } from './types.js'; // ClientCommandType (runtime values) from here
+import type { PlayerServer, Chunk } from './world/types.js'; // PlayerServer & Chunk from here
 import { encodeChunkDiff, type VoxelChange } from '../world/encodeChunkDiff.js';
 import { genChunk } from './world/genChunk.js'; // S1-2: Import genChunk
 import { testS1_1_HeightmapConsistency, type ServerGenChunkResult } from './world/chunkValidation.js'; // S1-1 Test, import type
@@ -47,6 +48,11 @@ const MAX_COLLIDERS_PER_TICK = 1024; // Process more colliders to speed up initi
 const MAX_COLLIDER_REMOVALS_PER_TICK = 50; // New: Max direct collider removals per tick
 const INITIAL_CHUNK_RADIUS = 1; // For a 3x3 area (center + 1 out)
 const SERVER_FLYING_SPEED = 10.0; // Matches client PLAYER_SPEED_FLYING for C2-1 check
+
+const MAX_WORLD_GEN_Y = 128;
+const MAX_LOD0_TERRAIN_HEIGHT = 100; // Example: if LOD0 only goes up to Y=100
+
+const MAX_IN_FLIGHT_PER_CLIENT = 32;
 
 // Updated MatchState interface to include ecsWorld
 interface MatchState extends IMatchState {
@@ -162,19 +168,50 @@ async function startServer() {
 
   let nextPlayerNumericId = 1;
 
-  wss.on('connection', (ws: ServerWebSocket) => {
+  wss.on('connection', async (ws: ServerWebSocket) => {
+    console.log('[Connect] New player connection incoming...');
+
     if (matchState.players.size + matchState.playersAwaitingFullInit.length >= MAX_CLIENTS) {
       sendError(ws, 'error', undefined, 'ServerFull', 'Server is full');
       ws.close();
       return;
     }
 
-    const playerId = nanoid(6);
-    console.log(`[Connect] Player ${playerId} connected. Adding to playersAwaitingFullInit.`);
+    const playerIdString = nanoid(6); // String ID, already present
+    const playerEntityId = addEntity(matchState.ecsWorld);
+    const playerNetworkId = nextPlayerNumericId++;
+
+    // Initialize server-side ECS components for the new player
+    addComponent(matchState.ecsWorld, Position, playerEntityId);
+    addComponent(matchState.ecsWorld, Rotation, playerEntityId);
+    addComponent(matchState.ecsWorld, Velocity, playerEntityId);
+    addComponent(matchState.ecsWorld, NetworkId, playerEntityId);
+    NetworkId.id[playerEntityId] = playerNetworkId; // Store the numeric network ID in the component
+    // Set initial position/rotation in ECS if needed, though physics body might override shortly
+    Position.x[playerEntityId] = PLAYER_SPAWN_POS.x;
+    Position.y[playerEntityId] = PLAYER_SPAWN_POS.y; // Default, will be refined by spawn logic
+    Position.z[playerEntityId] = PLAYER_SPAWN_POS.z;
+    Rotation.x[playerEntityId] = 0;
+    Rotation.y[playerEntityId] = 0;
+    Rotation.z[playerEntityId] = 0;
+    Velocity.vx[playerEntityId] = 0;
+    Velocity.vy[playerEntityId] = 0;
+    Velocity.vz[playerEntityId] = 0;
+
+    console.log(`[Connect] Player ${playerIdString} connected. EntityID: ${playerEntityId}, NetworkID: ${playerNetworkId}. Adding to playersAwaitingFullInit.`);
     const newPlayer: PlayerServer = {
-      id: playerId,
+      id: playerIdString,
       ws: ws,
-      lastProcessedInputSeq: 0,
+      position: { x: PLAYER_SPAWN_POS.x, y: PLAYER_SPAWN_POS.y, z: PLAYER_SPAWN_POS.z },
+      rotation: { x: 0, y: 0, z: 0 }, // Initial rotation
+      linvel: { x: 0, y: 0, z: 0 },   // Initial linear velocity
+      physicsBody: null, // Will be created later
+      lastInputSeq: -1, // Initialize with -1 or a suitable starting value
+      isInitialized: false,
+      entityId: playerEntityId, // Server-side ECS entity ID
+      networkId: playerNetworkId, // Numeric network ID
+      pendingChunks: new Map<number, number>(), // Initialize for server-side request throttling
+      // bodyHandle and colliderHandle will be assigned upon full initialization
     };
     matchState.playersAwaitingFullInit.push(newPlayer);
 
@@ -184,14 +221,14 @@ async function startServer() {
         const artificialMessage = { commandType: ClientCommandType.PLAYER_INPUT };
         // Ensure 'data' is treated as Buffer; ws types state it can be ArrayBuffer here too,
         // but for Node.js 'ws' server, 'data' is Buffer when binary if binaryType is 'nodebuffer' (default) or 'buffer'
-        handleMessage(ws, artificialMessage, data as Buffer, matchState, wss, playerId, newPlayer);
+        handleMessage(ws, artificialMessage, data as Buffer, matchState, wss, playerIdString, newPlayer);
       } else {
         // Data is a string or a Buffer containing a UTF-8 string (JSON message)
         const jsonDataString = Buffer.isBuffer(data) ? data.toString('utf8') : data;
         try {
           const parsedMessage = JSON.parse(jsonDataString);
           // Pass null for rawBuffer as this is a JSON message
-          handleMessage(ws, parsedMessage, null, matchState, wss, playerId, newPlayer);
+          handleMessage(ws, parsedMessage, null, matchState, wss, playerIdString, newPlayer);
         } catch (error) {
           console.error('[Server] Error parsing string message (JSON parse):', error, jsonDataString);
           sendError(ws, 'error', undefined, 'InvalidJSON', 'Could not parse JSON message.');
@@ -200,21 +237,21 @@ async function startServer() {
     });
 
     ws.on('close', () => {
-      console.log(`[Disconnect] Player ${playerId} disconnected.`);
-      const awaitingIndex = matchState.playersAwaitingFullInit.findIndex(p => p.id === playerId);
+      console.log(`[Disconnect] Player ${playerIdString} disconnected.`);
+      const awaitingIndex = matchState.playersAwaitingFullInit.findIndex(p => p.id === playerIdString);
       if (awaitingIndex > -1) {
         matchState.playersAwaitingFullInit.splice(awaitingIndex, 1);
-        console.log(`[Disconnect] Removed ${playerId} from playersAwaitingFullInit.`);
+        console.log(`[Disconnect] Removed ${playerIdString} from playersAwaitingFullInit.`);
       }
-      const playerToRemove = matchState.players.get(playerId);
+      const playerToRemove = matchState.players.get(playerIdString);
       if (playerToRemove) {
         removePlayerPhysicsBody(matchState.physicsWorld.raw, playerToRemove.bodyHandle, playerToRemove.colliderHandle);
-        matchState.players.delete(playerId);
-        console.log(`[Disconnect] Removed ${playerId} from active players and physics world.`);
+        matchState.players.delete(playerIdString);
+        console.log(`[Disconnect] Removed ${playerIdString} from active players and physics world.`);
       }
       wss.clients.forEach(client => {
         if (client !== ws && client.readyState === ServerWebSocket.OPEN) {
-          client.send(JSON.stringify({ type: 'playerLeft', playerId: playerId }));
+          client.send(JSON.stringify({ type: 'playerLeft', playerId: playerIdString }));
         }
       });
     });
@@ -395,30 +432,46 @@ async function startServer() {
         break;
       }
       case 'chunkRequest': {
-        const { cx, cz, seq, lod } = message;
-        // TODO: Validate lod (e.g., ensure it's a number, perhaps 0 for HIGH, 1 for LOW as per client's LODLevel enum)
-        // For now, we'll assume client sends a valid number representing LODLevel or handle undefined if not sent.
-        const requestedLOD = (typeof lod === 'number' && (lod === 0 || lod === 1)) ? lod : 0; // Default to LOD 0 (HIGH) if invalid/missing
+        const { cx, cz, lod, seq } = message; 
 
-        console.log(`[Server ChunkRequest] Received for cx: ${cx}, cz: ${cz}, lod: ${requestedLOD}, seq: ${seq} from player ${cmdPlayerId}`); // Added log
+        // Ensure player object exists (already done above, but good to be mindful)
+        if (!player) {
+            console.warn(`[Server ChunkRequest] Player ${cmdPlayerIdFromConnection} not found during chunk request. Critical state.`);
+            sendError(ws, 'chunkResponseError', seq, 'internal_error', 'Player session not found.');
+            return;
+        }
 
-        if (typeof cx !== 'number' || typeof cz !== 'number') {
-          sendError(ws, 'chunkResponseError', seq, 'BadRequest', 'Invalid cx/cz.');
+        if (player.pendingChunks.size >= MAX_IN_FLIGHT_PER_CLIENT) {
+          console.warn(`[Server ChunkRequest Throttled] Player ${player.id} (cx:${cx},cz:${cz},seq:${seq}) REJECTED. Pending: ${player.pendingChunks.size}`);
+          sendError(ws, 'chunkResponseError', seq, 'too_many_in_flight', 'Too many chunk requests in flight.');
           return;
         }
+
+        player.pendingChunks.set(seq, Date.now());
+
         try {
-          // MODIFIED: Pass requestedLOD to getOrCreateChunk
+          const requestedLOD: LODLevel = (typeof lod === 'number' && (lod === LODLevel.LOW || lod === LODLevel.HIGH)) ? lod : LODLevel.HIGH; // Validate and default LOD
           const chunk = await getOrCreateChunk(currentMatchState, currentMatchState.seed, cx, cz, requestedLOD);
-          const voxelsArray = Array.from(chunk.data);
+          
+          // chunk is guaranteed to be a Chunk if no error was thrown by getOrCreateChunk
+          const voxelsBase64 = Buffer.from(chunk.data).toString('base64');
+          
           if (ws.readyState === ServerWebSocket.OPEN) {
-            // ADDED requestedLOD to the response as 'lod'
-            const responseMessage = { type: 'chunkResponse', cx, cz, voxels: voxelsArray, seq, lod: requestedLOD };
-            ws.send(JSON.stringify(responseMessage));
-            console.log(`[Server ChunkResponse] Sent for cx: ${cx}, cz: ${cz}, lod: ${requestedLOD}, seq: ${seq} to player ${cmdPlayerId}`); // Added log
+            ws.send(JSON.stringify({
+              type: 'chunkResponse',
+              cx: chunk.x,
+              cz: chunk.z,
+              voxels: voxelsBase64,
+              lod: chunk.lodLevel, 
+              seq: seq, 
+              heightmap: Array.from(chunk.heightmap || []),
+            }));
           }
         } catch (error) {
-          console.error(`[Server] Error processing chunk request for ${cx},${cz}:`, error);
-          sendError(ws, 'chunkResponseError', seq, 'InternalServerError', `Error for chunk ${cx},${cz}: ${error instanceof Error ? error.message : String(error)}`);
+          console.error(`[Server ChunkRequest EXCEPTION] Error processing chunk request for (${cx},${cz}), player ${player.id}, seq: ${seq}:`, error);
+          sendError(ws, 'chunkResponseError', seq, 'internal_server_error', 'Internal server error during chunk processing.');
+        } finally {
+          player.pendingChunks.delete(seq); 
         }
         break;
       }
@@ -434,29 +487,107 @@ async function startServer() {
           sendError(ws, 'mineError', seq, 'OutOfBounds', 'Target out of bounds.');
           break;
         }
-        const success = await setBlock(currentMatchState, currentMatchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ, 0);
-        if (success) {
-          const chunkX = Math.floor(targetVoxelX / CHUNK_SIZE_X);
-          const chunkZ = Math.floor(targetVoxelZ / CHUNK_SIZE_Z);
-          const localX = ((targetVoxelX % CHUNK_SIZE_X) + CHUNK_SIZE_X) % CHUNK_SIZE_X;
-          const localY = targetVoxelY;
-          const localZ = ((targetVoxelZ % CHUNK_SIZE_Z) + CHUNK_SIZE_Z) % CHUNK_SIZE_Z;
-          const voxelFlatIndex = localY * (CHUNK_SIZE_X * CHUNK_SIZE_Z) + localZ * CHUNK_SIZE_X + localX;
-          const changes: VoxelChange[] = [{ voxelFlatIndex, newBlockId: 0 }];
-          const rleBytes = encodeChunkDiff(changes);
-          const blockUpdateMessage = {
-            type: 'blockUpdate',
-            chunkX: chunkX,
-            chunkZ: chunkZ,
-            rleBytes: Array.from(rleBytes)
-          };
-          wssInstance.clients.forEach((client: ServerWebSocket) => {
-            if (client.readyState === ServerWebSocket.OPEN) {
-              client.send(JSON.stringify(blockUpdateMessage));
-            }
-          });
+
+        const chunkX = Math.floor(targetVoxelX / CHUNK_SIZE_X);
+        const chunkZ = Math.floor(targetVoxelZ / CHUNK_SIZE_Z);
+        const cKey = `${chunkX},${chunkZ},L${LODLevel.HIGH}`;
+
+        const localX = ((targetVoxelX % CHUNK_SIZE_X) + CHUNK_SIZE_X) % CHUNK_SIZE_X;
+        const localY = targetVoxelY;
+        const localZ = ((targetVoxelZ % CHUNK_SIZE_Z) + CHUNK_SIZE_Z) % CHUNK_SIZE_Z;
+
+        // Check if the block is already air BEFORE any modifications
+        const currentBlockValue = await getBlock(currentMatchState, currentMatchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ);
+        if (currentBlockValue === BLOCK_AIR || currentBlockValue === null) {
+          sendError(ws, 'mineError', seq, 'AlreadyAir', 'Target block is already air.');
+          break;
+        }
+        
+        console.log(`[Server MINE_BLOCK Greedy] Player ${cmdPlayerId} mining ${targetVoxelX},${targetVoxelY},${targetVoxelZ} in chunk ${cKey}`);
+
+        const chunkForModification = currentMatchState.chunks.get(cKey);
+
+        if (chunkForModification) {
+          // 1. IMMEDIATELY Remove all existing colliders for this chunk
+          const handlesToRemove = chunkForModification.colliderHandles ?? [];
+          if (handlesToRemove.length > 0) {
+              console.log(`[Server MINE_BLOCK Greedy] Attempting to immediately remove ${handlesToRemove.length} existing collider handles from chunk ${cKey}.`);
+              handlesToRemove.forEach((handle: number) => {
+                  try {
+                      // Ensure physicsWorld and raw are available
+                      if (currentMatchState.physicsWorld && currentMatchState.physicsWorld.raw) {
+                          const collider = currentMatchState.physicsWorld.raw.getCollider(handle);
+                          console.log(`[MINE_BLOCK ImmediateRemoveAttempt] Chunk ${cKey}, Handle ${handle}, Collider found: ${collider !== null}`); // VERBOSE LOG
+                          if (collider) {
+                              currentMatchState.physicsWorld.raw.removeCollider(collider, true); // true for wakeUp
+                          } else {
+                              console.warn(`[MINE_BLOCK ImmediateRemoveFailure] Failed to get collider for handle ${handle} in chunk ${cKey}. It might have been already removed or handle is stale.`);
+                          }
+                      } else {
+                          console.error(`[MINE_BLOCK ImmediateRemove] physicsWorld.raw not available for chunk ${cKey}. Cannot remove colliders.`);
+                          // Depending on desired error handling, you might want to stop processing here.
+                          // For now, it will try to continue, but subsequent rebuild might be problematic.
+                      }
+                  } catch (e) {
+                      console.error(`[MINE_BLOCK ImmediateRemove] Error removing collider handle ${handle} from chunk ${cKey}:`, e);
+                  }
+              });
+          }
+          // This ensures the chunk object's list is clean before buildChunkColliders repopulates it.
+          // buildChunkColliders will also do chunkObject.colliderHandles = [] at its start, which is fine.
+          chunkForModification.colliderHandles = [];
+
+
+          // 2. Update voxel data using the setBlock from voxelIO.ts
+          // setBlock returns the modified chunk or null
+          const updatedChunk = await setBlock(currentMatchState, currentMatchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ, BLOCK_AIR);
+
+          if (updatedChunk) { // updatedChunk should be the same instance as chunkForModification if setBlock modifies in place and returns it
+            // Set flag for detailed logging in buildChunkColliders
+            global.LOG_COLLIDERS_FOR_CHUNK_KEY = cKey; 
+
+            // 3. Rebuild colliders for the modified chunk
+            console.log(`[Server MINE_BLOCK Greedy] Rebuilding colliders for chunk ${cKey}.`);
+            const newCollidersEnqueued = buildChunkColliders(
+              currentMatchState.physicsWorld.raw,
+              updatedChunk, 
+              updatedChunk.data, 
+              chunkX,
+              chunkZ,
+              currentMatchState,
+              // Pass local coords of mined block for diagnostic logging
+              localX, 
+              localY, 
+              localZ
+            );
+
+            // Clear the logging flag
+            global.LOG_COLLIDERS_FOR_CHUNK_KEY = null;
+
+            console.log(`[Server MINE_BLOCK Greedy] Rebuild for ${cKey} enqueued ${newCollidersEnqueued} new collider tasks.`); // Added a log for a more complete picture
+
+            // 4. Broadcast the block update to all clients
+            const voxelFlatIndex = localY * (CHUNK_SIZE_X * CHUNK_SIZE_Z) + localZ * CHUNK_SIZE_X + localX;
+            const changes: VoxelChange[] = [{ voxelFlatIndex, newBlockId: BLOCK_AIR }];
+            const rleBytes = encodeChunkDiff(changes);
+            const blockUpdateMessage = {
+              type: 'blockUpdate',
+              chunkX: chunkX,
+              chunkZ: chunkZ,
+              rleBytes: Array.from(rleBytes)
+            };
+            wssInstance.clients.forEach((client: ServerWebSocket) => {
+              if (client.readyState === ServerWebSocket.OPEN) {
+                client.send(JSON.stringify(blockUpdateMessage));
+              }
+            });
+          } else {
+            console.error(`[Server MINE_BLOCK Greedy] setBlock failed for ${targetVoxelX},${targetVoxelY},${targetVoxelZ}`);
+            sendError(ws, 'mineError', seq, 'SetBlockFailed', 'Server failed to set block.');
+          }
         } else {
-          sendError(ws, 'mineError', seq, 'SetBlockFailed', 'Server failed to set block.');
+          console.warn(`[Server MINE_BLOCK Greedy] Chunk ${cKey} not found. Cannot process mine operation.`);
+          sendError(ws, 'mineError', seq, 'ChunkNotFound', 'Chunk ' + cKey + ' not found during mine op.');
         }
         break;
       }
@@ -481,10 +612,56 @@ async function startServer() {
             sendError(ws, 'placeError', seq, 'BlockOccupied', `Occupied by ${currentBlockValue}.`);
             break;
         }
-        const success = await setBlock(currentMatchState, currentMatchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ, blockId);
-        if (success) {
+        const updatedChunk = await setBlock(currentMatchState, currentMatchState.seed, targetVoxelX, targetVoxelY, targetVoxelZ, blockId);
+
+        if (updatedChunk) { // Check if setBlock was successful and returned the chunk
             const chunkX = Math.floor(targetVoxelX / CHUNK_SIZE_X);
             const chunkZ = Math.floor(targetVoxelZ / CHUNK_SIZE_Z);
+            const cKey = `${chunkX},${chunkZ},L${LODLevel.HIGH}`; // Define cKey for consistency
+
+            // 1. IMMEDIATELY Remove all existing colliders for this chunk (similar to MINE_BLOCK)
+            const handlesToRemove = updatedChunk.colliderHandles ?? [];
+            if (handlesToRemove.length > 0) {
+                console.log(`[Server PLACE_BLOCK Greedy] Attempting to immediately remove ${handlesToRemove.length} existing collider handles from chunk ${cKey}.`);
+                handlesToRemove.forEach((handle: number) => {
+                    try {
+                        if (currentMatchState.physicsWorld && currentMatchState.physicsWorld.raw) {
+                            const collider = currentMatchState.physicsWorld.raw.getCollider(handle);
+                            console.log(`[PLACE_BLOCK ImmediateRemoveAttempt] Chunk ${cKey}, Handle ${handle}, Collider found: ${collider !== null}`); // VERBOSE LOG
+                            if (collider) {
+                                currentMatchState.physicsWorld.raw.removeCollider(collider, true);
+                            } else {
+                                console.warn(`[PLACE_BLOCK ImmediateRemoveFailure] Failed to get collider for handle ${handle} in chunk ${cKey}. It might have been already removed or handle is stale.`);
+                            }
+                        }
+                    } catch (e) {
+                        console.error(`[PLACE_BLOCK ImmediateRemove] Error removing collider handle ${handle} from chunk ${cKey}:`, e);
+                    }
+                });
+            }
+            updatedChunk.colliderHandles = []; // Reset before rebuilding
+
+            // Set flag for detailed logging in buildChunkColliders, if needed for PLACE_BLOCK
+            // global.LOG_COLLIDERS_FOR_CHUNK_KEY = cKey;
+
+            // 2. Rebuild colliders for the modified chunk (this was missing)
+            console.log(`[Server PLACE_BLOCK Greedy] Rebuilding colliders for chunk ${cKey}.`);
+            const newCollidersEnqueued = buildChunkColliders(
+              currentMatchState.physicsWorld.raw,
+              updatedChunk,
+              updatedChunk.data,
+              chunkX,
+              chunkZ,
+              currentMatchState
+              // No specific mined block coords to pass for PLACE_BLOCK diagnostics
+            );
+
+            // Clear the logging flag if it was set
+            // global.LOG_COLLIDERS_FOR_CHUNK_KEY = null;
+
+            console.log(`[Server PLACE_BLOCK Greedy] Rebuild for ${cKey} enqueued ${newCollidersEnqueued} new collider tasks.`);
+
+            // 3. Broadcast the block update to all clients (was already here)
             const localX = ((targetVoxelX % CHUNK_SIZE_X) + CHUNK_SIZE_X) % CHUNK_SIZE_X;
             const localY = targetVoxelY;
             const localZ = ((targetVoxelZ % CHUNK_SIZE_Z) + CHUNK_SIZE_Z) % CHUNK_SIZE_Z;
@@ -601,30 +778,51 @@ async function startServer() {
             }
 
             const dynamicSpawnPos = { x: PLAYER_SPAWN_POS.x, y: spawnY, z: PLAYER_SPAWN_POS.z };
-            const { body, collider } = createPlayerBody(matchState.physicsWorld.raw, dynamicSpawnPos); // Use matchState
-            player.bodyHandle = body.handle;
-            player.colliderHandle = collider.handle;
-            matchState.players.set(player.id, player); // Use matchState
-            console.log(`[Server] Player ${player.id} physics body created (H:${body.handle}) at (${dynamicSpawnPos.x.toFixed(2)}, ${dynamicSpawnPos.y.toFixed(2)}, ${dynamicSpawnPos.z.toFixed(2)}) and added to active players.`);
+            const physicsPlayerObjects = createPlayerBody(matchState.physicsWorld.raw, dynamicSpawnPos);
+            
+            if (physicsPlayerObjects && physicsPlayerObjects.body && physicsPlayerObjects.collider) {
+              player.bodyHandle = physicsPlayerObjects.body.handle;
+              player.colliderHandle = physicsPlayerObjects.collider.handle;
+              matchState.players.set(player.id, player);
+              console.log(`[Server] Player ${player.id} (NetID: ${player.networkId}) physics body created (BodyH:${physicsPlayerObjects.body.handle}, ColliderH:${physicsPlayerObjects.collider.handle}) at (${dynamicSpawnPos.x.toFixed(2)}, ${dynamicSpawnPos.y.toFixed(2)}, ${dynamicSpawnPos.z.toFixed(2)}) and added to active players.`);
 
-            const initMessage = {
-              type: 'init',
-              playerId: player.id,
-              initialPos: dynamicSpawnPos, // Use the calculated dynamicSpawnPos
-              state: {
-                players: Array.from(matchState.players.values())
-                  .filter(p => p.id !== player.id && p.bodyHandle !== undefined)
-                  .map(p => {
-                    const pBody = matchState.physicsWorld.raw.getRigidBody(p.bodyHandle!);
-                    return {
-                      id: p.id,
-                      position: pBody ? pBody.translation() : {x:0,y:0,z:0},
-                    };
-                  }),
-              },
-            };
-            player.ws.send(JSON.stringify(initMessage));
-            console.log(`[Server] Sent 'init' message to player ${player.id}`);
+              const initMessage = {
+                type: 'init',
+                playerId: player.id,         // String ID for this client
+                entityId: player.entityId,   // This client's server-side ECS entityId
+                networkId: player.networkId, // This client's numeric networkId
+                initialPos: dynamicSpawnPos,
+                state: {
+                  players: Array.from(matchState.players.values())
+                    .filter(p => p.id !== player.id && p.bodyHandle !== undefined && p.bodyHandle > 0 && p.entityId !== undefined && p.networkId !== undefined)
+                    .map(p => {
+                      const pBody = matchState.physicsWorld.raw.getRigidBody(p.bodyHandle!);
+                      const pos = pBody ? pBody.translation() : { x: PLAYER_SPAWN_POS.x, y: PLAYER_SPAWN_POS.y, z: PLAYER_SPAWN_POS.z }; // Fallback position
+                      const rot = pBody ? pBody.rotation() : { x: 0, y: 0, z: 0, w: 1 }; // Fallback rotation
+                      return {
+                        id: p.id,                 // String ID of other player
+                        entityId: p.entityId,     // Server-side ECS entityId of other player
+                        networkId: p.networkId,   // Numeric networkId of other player
+                        position: {x: pos.x, y: pos.y, z: pos.z},
+                        rotation: {x: rot.x, y: rot.y, z: rot.z, w: rot.w },
+                        // isFlying: p.isFlying ?? false, // Add other relevant initial states
+                      };
+                    }),
+                },
+              };
+              player.ws.send(JSON.stringify(initMessage));
+              console.log(`[Server] Sent 'init' message to player ${player.id} (NetID: ${player.networkId})`);
+            } else {
+              console.error(`[Server CRITICAL] Failed to create physics body for player ${player.id}. Player will not be fully initialized.`);
+              // Optionally, send an error to the client and close their connection, or keep them in awaiting queue for a retry.
+              // For now, they will remain in playersAwaitingFullInit effectively, if not moved to stillAwaiting later.
+              // Send an error and close to prevent inconsistent state:
+              sendError(player.ws, 'error', undefined, 'PlayerSpawnFailed', 'Server failed to create physics representation.');
+              player.ws.close(); // Close the connection as the player cannot participate
+              // Do not add to stillAwaiting, as this is a hard failure for this attempt.
+              // The 'close' handler will remove them from playersAwaitingFullInit.
+              return; // Skip to next player in forEach
+            }
           } catch (e) {
             console.error(`[Server] Error fully initializing player ${player.id}:`, e);
             sendError(player.ws, 'error', undefined, 'InitFailed', `Failed to initialize player: ${e instanceof Error ? e.message : String(e)}`);

@@ -4,17 +4,10 @@ export type { PhysicsWorld };
 import type { Player as SharedPlayer } from '../shared/types.js'; // Import SharedPlayer
 export type { SharedPlayer }; // Re-export SharedPlayer
 import type { ChunkGenerationQueue } from './world/chunkGenerationQueue.js'; // Added import
+import type { PlayerServer as WorldPlayerServer, Chunk as WorldChunk } from './world/types.js'; // Import from world/types
 
 // Server-specific player type
-export interface PlayerServer extends SharedPlayer {
-  ws: ServerWebSocket;
-  entityId?: number; // If using server-side ECS for players
-  bodyHandle?: number; // Make optional, assigned later
-  colliderHandle?: number; // Make optional, assigned later
-  isFlying?: boolean; // Added to store flying state
-  yaw?: number; // Added to store player's yaw
-  lastInputHadMovementIntent?: boolean; // Flag to track if last input included W,A,S,D movement
-}
+// export interface PlayerServer extends SharedPlayer { ... }
 
 // Duplicated from client src/net/types.ts to avoid pathing issues with server's rootDir
 export enum ClientCommandType {
@@ -23,18 +16,12 @@ export enum ClientCommandType {
   PLACE_BLOCK = 'placeBlock',
 }
 
-export interface Chunk {
-  x: number;
-  z: number;
-  data: Uint8Array;
-  heightmap?: Uint8Array;
-  lastModified: number;
-  colliderHandles?: number[];
-}
+// Chunk interface - This can be removed if WorldChunk is sufficient
+// export interface Chunk { ... }
 
 export interface MatchState {
-  players: Map<string, PlayerServer>;
-  chunks: Map<string, Chunk>;
+  players: Map<string, WorldPlayerServer>; // Use imported PlayerServer
+  chunks: Map<string, WorldChunk>; // Use imported Chunk
   lastUpdate: number;
   seed: number;
   physicsWorld?: PhysicsWorld;
@@ -53,4 +40,8 @@ export type MessageType =
 export interface Message {
   type: MessageType;
   [key: string]: any;
+}
+
+export interface ServerGenChunkResult {
+  // ... existing code ...
 } 

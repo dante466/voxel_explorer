@@ -23,11 +23,13 @@ const COLLISION_EPSILON = 0.001;
  *
  * @param proposedCenterPos The proposed center position of the capsule.
  * @param chunkManager To query voxel data.
+ * @param autoStepEnabled Flag to enable or disable auto-step vertical adjustment
  * @returns The corrected center position.
  */
 export function resolveAABBvoxelCollision(
     proposedCenterPos: THREE.Vector3,
-    chunkManager: ChunkManager
+    chunkManager: ChunkManager,
+    autoStepEnabled: boolean
 ): THREE.Vector3 {
     const correctedPos = proposedCenterPos.clone();
     const capsuleRadius = HALF_WIDTH;
@@ -67,9 +69,16 @@ export function resolveAABBvoxelCollision(
     }
     
     // If player's capsule bottom is below the highest found ground surface, adjust Y
-    if (maxGroundSurfaceY > -Infinity && capsuleBottomY < maxGroundSurfaceY) {
-        correctedPos.y = maxGroundSurfaceY + HALF_HEIGHT; // Re-enabled
-        // console.log(`[VoxelCollide] Vertical Adjust: ProposedBottomY: ${capsuleBottomY.toFixed(2)}, MaxGroundY: ${maxGroundSurfaceY.toFixed(2)}, CorrectedCenterY: ${correctedPos.y.toFixed(2)}`);
+    if (autoStepEnabled) {
+      if (maxGroundSurfaceY > -Infinity && capsuleBottomY < maxGroundSurfaceY) {
+          correctedPos.y = maxGroundSurfaceY + HALF_HEIGHT; 
+          // console.log(`[VoxelCollide] Vertical Adjust (AutoStep ON): ProposedBottomY: ${capsuleBottomY.toFixed(2)}, MaxGroundY: ${maxGroundSurfaceY.toFixed(2)}, CorrectedCenterY: ${correctedPos.y.toFixed(2)}`);
+      }
+    } else {
+      // Optional: Log when auto-step is off and this vertical adjustment would have occurred
+      // if (maxGroundSurfaceY > -Infinity && capsuleBottomY < maxGroundSurfaceY) {
+      //    console.log(`[VoxelCollide] Vertical Adjust (AutoStep OFF): Would have snapped. ProposedBottomY: ${capsuleBottomY.toFixed(2)}, MaxGroundY: ${maxGroundSurfaceY.toFixed(2)}`);
+      // }
     }
     
     // --- Horizontal Adjustment (Simplified AABB-style push-out for now) ---

@@ -1,40 +1,42 @@
 import RAPIER from '@dimforge/rapier3d-compat';
 import type { MatchState, Chunk as ServerChunk } from '../types';
+import { CHUNK_SIZE_X, CHUNK_SIZE_Y, CHUNK_SIZE_Z } from '../../shared/constants';
 
 /** 
- * Queues collider removals for a given chunk and clears its colliderHandles array.
- * Returns the number of colliders queued for removal.
+ * Queues all existing collider handles from a chunk for removal and clears the chunk's handle store.
+ * This is typically used during chunk garbage collection.
+ * Returns the number of handles queued for removal.
  */
 export function removeChunkColliders(
-  world: RAPIER.World,
+  _world: RAPIER.World, // World parameter is no longer strictly needed here as we just collect handles
   state: MatchState,
-  chunk: ServerChunk // Use ServerChunk to ensure colliderHandles is potentially there
+  chunk: ServerChunk 
 ): number {
-  if (!chunk.colliderHandles || chunk.colliderHandles.length === 0) {
+  if (!chunk.colliderHandles) {
+    // console.log(`[Physics/RemoveColliders GC] Chunk ${chunk.x},${chunk.z} has no colliderHandles array. Nothing to remove.`);
     return 0;
   }
 
-  const handlesToRemove = [...chunk.colliderHandles]; // Copy handles before clearing
-  let count = 0;
+  let handlesQueued = 0;
 
-  for (const handle of handlesToRemove) {
-    state.pendingColliders.push(() => {
-      try {
-        const collider = world.getCollider(handle);
-        if (collider) { // Check if collider still exists before trying to remove
-            // The second argument to removeCollider when passing a Collider object is 'wakeUp'
-            world.removeCollider(collider, true); // Typically false if parent body management is separate or implicit
-        } else {
-            // console.warn(`[Physics/RemoveColliders] Attempted to remove already removed/invalid collider handle: ${handle} for chunk ${chunk.x},${chunk.z}`);
-        }
-      } catch (e) {
-        console.error(`[Physics/RemoveColliders] Error removing collider handle ${handle} for chunk ${chunk.x},${chunk.z}:`, e);
-      }
-    });
-    count++;
+  if (!state.handlesPendingRemoval) {
+    state.handlesPendingRemoval = [];
   }
 
-  // console.log(`[Physics/RemoveColliders] Queued ${count} colliders for removal from chunk ${chunk.x},${chunk.z}`);
-  chunk.colliderHandles = []; // Mark as detached immediately
-  return count;
+  // Iterate over the 1D array of collider handles
+  for (const handle of chunk.colliderHandles) {
+    if (typeof handle === 'number') {
+      state.handlesPendingRemoval.push(handle);
+      handlesQueued++;
+    }
+  }
+
+  if (handlesQueued > 0) {
+    // console.log(`[Physics/RemoveColliders GC] Queued ${handlesQueued} collider handles for removal from chunk ${chunk.x},${chunk.z}`);
+  }
+  
+  // Clear the handles on the chunk object by setting it to an empty array.
+  chunk.colliderHandles = []; 
+
+  return handlesQueued;
 } 

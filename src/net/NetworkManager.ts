@@ -200,6 +200,7 @@ export class NetworkManager {
                       keys: input.keys,
                       chunkManager: this.chunkManager,
                       getIsOnGround: () => this.movementControls.isOnGround(), // Added to resolve TS error
+                      autoStepEnabled: this.movementControls.getAutoStepState(), // ADDED
                     };
                     const outputState = calculatePlayerMovement(inputState); 
                     Transform.position.x[this.playerEntityId] = outputState.newPosition.x;
@@ -278,15 +279,17 @@ export class NetworkManager {
     // Handle JSON messages (init, chunk responses, block updates, errors, playerLeft)
     if (this.chunkManager) {
       if (message.type === 'chunkResponse') {
-        if (typeof message.cx === 'number' && typeof message.cz === 'number' && Array.isArray(message.voxels)) {
+        if (typeof message.cx === 'number' && 
+            typeof message.cz === 'number' && 
+            typeof message.voxels === 'string') {
           this.chunkManager.handleChunkResponse(
             message.cx, 
             message.cz, 
-            message.voxels.filter((v: any) => typeof v === 'number'),
+            message.voxels,
             message.lod,
             message.seq // Pass sequence number
           );
-        } else { console.warn('[NetworkManager] Malformed chunkResponse:', message); }
+        } else { console.warn('[NetworkManager] Malformed chunkResponse (expected voxels as string):', message); }
         return;
       } else if (message.type === 'chunkResponseError') {
         if (typeof message.cx === 'number' && typeof message.cz === 'number' && typeof message.reason === 'string') {

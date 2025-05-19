@@ -9,6 +9,9 @@ export interface VoxelRaycastResult {
   distance: number;             // Distance from ray origin to intersection point (approximate center or face)
 }
 
+let lastRaycastLogTime = 0;
+const RAYCAST_LOG_INTERVAL = 2000; // Log every 2 seconds
+
 /**
  * Casts a ray into the voxel world and returns information about the first hit voxel.
  * Uses the DDA (Digital Differential Analysis) algorithm.
@@ -26,6 +29,11 @@ export function raycastVoxel(
   maxDistance: number,
   // Optional: world: IWorld // If direct entity checks or broad phase needed later
 ): VoxelRaycastResult | null {
+  const now = Date.now();
+  const shouldLog = (now - lastRaycastLogTime > RAYCAST_LOG_INTERVAL);
+  if (shouldLog) {
+    console.log(`[raycastVoxel] Origin: ${rayOrigin.x.toFixed(2)},${rayOrigin.y.toFixed(2)},${rayOrigin.z.toFixed(2)} Dir: ${rayDirection.x.toFixed(2)},${rayDirection.y.toFixed(2)},${rayDirection.z.toFixed(2)}`);
+  }
 
   let currentVoxelX = Math.floor(rayOrigin.x);
   let currentVoxelY = Math.floor(rayOrigin.y);
@@ -55,8 +63,11 @@ export function raycastVoxel(
 
   // First, check the voxel containing the ray's origin, if ray starts inside world bounds
   // This is important if the ray starts inside a block.
-  // ChunkManager's hasBlock handles world coordinate bounds implicitly through chunk lookup.
-  if (chunkManager.hasBlock(currentVoxelX, currentVoxelY, currentVoxelZ)) {
+  const originBlockExists = chunkManager.hasBlock(currentVoxelX, currentVoxelY, currentVoxelZ);
+  if (shouldLog) {
+    console.log(`[raycastVoxel] Initial check at origin voxel (${currentVoxelX},${currentVoxelY},${currentVoxelZ}): exists = ${originBlockExists}`);
+  }
+  if (originBlockExists) {
     // Ray starts inside a block. This is the hit.
     // Normal calculation in this case is tricky without knowing entry face, default or estimate.
     // For simplicity, if starting inside, we might not have a clear 'entry' normal.
@@ -114,7 +125,12 @@ export function raycastVoxel(
     if (distanceTraveled > maxDistance) break; // Exceeded max distance
 
     // Check the new voxel the ray has entered
-    if (chunkManager.hasBlock(currentVoxelX, currentVoxelY, currentVoxelZ)) {
+    const hitBlockExists = chunkManager.hasBlock(currentVoxelX, currentVoxelY, currentVoxelZ);
+    if (shouldLog) {
+      console.log(`[raycastVoxel] DDA step to (${currentVoxelX},${currentVoxelY},${currentVoxelZ}): exists = ${hitBlockExists}, dist = ${distanceTraveled.toFixed(2)}`);
+    }
+
+    if (hitBlockExists) {
       hitVoxelCoords = new THREE.Vector3(currentVoxelX, currentVoxelY, currentVoxelZ);
       const hitPointCenter = new THREE.Vector3(currentVoxelX + 0.5, currentVoxelY + 0.5, currentVoxelZ + 0.5);
       
@@ -126,6 +142,9 @@ export function raycastVoxel(
       // intersection = rayOrigin + rayDirection * t
       // For now, distanceTraveled is to the *edge* of the voxel boundary crossed.
 
+      if (shouldLog) {
+        lastRaycastLogTime = now; // Update time only if we logged
+      }
       return {
         position: hitPointCenter, // Center of the hit voxel for easy highlighting
         normal: hitNormal.clone(),
@@ -140,6 +159,9 @@ export function raycastVoxel(
     }
   }
 
+  if (shouldLog) {
+    lastRaycastLogTime = now; // Update time only if we logged
+  }
   return null; // No voxel hit within maxDistance
 }
 

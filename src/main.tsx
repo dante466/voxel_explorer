@@ -260,6 +260,8 @@ async function main() {
   const initialPlayerX = Transform.position.x[playerEntity];
   const initialPlayerZ = Transform.position.z[playerEntity];
 
+  let autoStepEnabled = true;
+
   // Add a label for the render distance slider
   const renderDistanceLabel = document.createElement('span');
   renderDistanceLabel.id = 'renderDistanceVal';
@@ -316,7 +318,13 @@ async function main() {
   if (!hasComponent(world, Object3DRef, playerEntity)) { addComponent(world, Object3DRef, playerEntity); }
   Object3DRef.value[playerEntity] = playerEntity;
   object3DMap.set(playerEntity, playerModelMesh);
-  const movementSystemControls: PlayerMovementSystemControls = createPlayerMovementSystem(world, playerEntity, document, chunkManager);
+  const movementSystemControls: PlayerMovementSystemControls = createPlayerMovementSystem(
+    world, 
+    playerEntity, 
+    document, 
+    chunkManager,
+    () => autoStepEnabled
+  );
   const playerMovementSystem = movementSystemControls.system;
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
@@ -404,6 +412,7 @@ async function main() {
   menuContent.innerHTML = `
     <h3 style="margin:0 0 10px 0">Admin Menu</h3>
     <div><label><input type="checkbox" id="flyingToggle" checked> Flying</label></div>
+    <div><label><input type="checkbox" id="autoStepToggle" checked> Auto-Step</label></div>
     <div><label><input type="checkbox" id="collisionToggle"> Collisions</label></div>
     <div><label><input type="checkbox" id="highlighterToggle" checked> Highlighter</label></div>
     <div><label><input type="checkbox" id="crosshairToggle" checked> Crosshair</label></div>
@@ -452,6 +461,7 @@ async function main() {
   crosshairElement.style.display = showCrosshair ? 'block' : 'none';
   document.body.appendChild(crosshairElement);
   const flyingToggle = document.getElementById('flyingToggle') as HTMLInputElement;
+  const autoStepToggle = document.getElementById('autoStepToggle') as HTMLInputElement;
   const collisionToggle = document.getElementById('collisionToggle') as HTMLInputElement;
   const highlighterToggle = document.getElementById('highlighterToggle') as HTMLInputElement;
   const crosshairToggle = document.getElementById('crosshairToggle') as HTMLInputElement;
@@ -460,6 +470,7 @@ async function main() {
   const timeOfDayValueSpan = document.getElementById('timeOfDayValue') as HTMLSpanElement;
   let isTimeFrozen = false;
   if (flyingToggle) flyingToggle.checked = movementSystemControls.isFlying();
+  if (autoStepToggle) autoStepToggle.checked = autoStepEnabled;
   if (collisionToggle) collisionToggle.checked = showCollisionBoxes;
   if (highlighterToggle) highlighterToggle.checked = showBlockHighlighter;
   if (crosshairToggle) crosshairToggle.checked = showCrosshair;
@@ -467,6 +478,12 @@ async function main() {
   if (timeOfDaySlider) timeOfDaySlider.value = timeOfDay.toFixed(2);
   if (timeOfDayValueSpan) timeOfDayValueSpan.textContent = formatTimeOfDay(timeOfDay);
   flyingToggle.addEventListener('change', () => { movementSystemControls.toggleFlying(); flyingToggle.checked = movementSystemControls.isFlying(); });
+  if (autoStepToggle) {
+    autoStepToggle.addEventListener('change', (e) => { 
+      autoStepEnabled = (e.target as HTMLInputElement).checked; 
+      console.log(`[Admin] Auto-Step ${autoStepEnabled ? 'enabled' : 'disabled'}`);
+    });
+  }
   collisionToggle.addEventListener('change', (e) => { showCollisionBoxes = (e.target as HTMLInputElement).checked; });
   highlighterToggle.addEventListener('change', (e) => { showBlockHighlighter = (e.target as HTMLInputElement).checked; if (!showBlockHighlighter && voxelHighlighter) voxelHighlighter.update(null); });
   crosshairToggle.addEventListener('change', (e) => { showCrosshair = (e.target as HTMLInputElement).checked; if (crosshairElement) crosshairElement.style.display = showCrosshair ? 'block' : 'none'; });
@@ -531,11 +548,22 @@ async function main() {
   const networkManager = new NetworkManager(`ws://${window.location.hostname}:3000`, world, playerEntity, movementSystemControls, chunkManager, scene, onServerInitCallback);
   networkManager.connect();
   const MAX_RAYCAST_DISTANCE = 100;
+
+  let lastHighlightLogTime = 0;
+  const HIGHLIGHT_LOG_INTERVAL = 2000; // Log every 2 seconds
+
   function updateCenterScreenVoxelHighlight() {
     if (!gameCamera || !chunkManager || !voxelHighlighter) return;
     if (!showBlockHighlighter) { voxelHighlighter.update(null); return; }
     const pickRay = getCenterScreenRay(gameCamera);
     const result = raycastVoxel(pickRay.origin, pickRay.direction, chunkManager, MAX_RAYCAST_DISTANCE);
+
+    const now = Date.now();
+    if (now - lastHighlightLogTime > HIGHLIGHT_LOG_INTERVAL) {
+      console.log('[Main updateCenterScreenVoxelHighlight] Raycast result:', result ? { voxel: result.voxel, normal: result.normal, dist: result.distance } : null);
+      lastHighlightLogTime = now;
+    }
+
     voxelHighlighter.update(result ? result.position : null);
   }
   function handleBlockInteraction(event: MouseEvent) {
@@ -565,8 +593,9 @@ async function main() {
     if (hit && hit.voxel && hit.normal) {
       console.log('[Main] Raycast hit valid block. Voxel:', hit.voxel, 'Normal:', hit.normal);
       if (event.button === 0) { // Left mouse button
-        console.log('[Main] Attempting to send MINE command for voxel:', hit.voxel); // Log 5: Before sending command
+        console.log('[Main] Attempting to send MINE command for voxel:', hit.voxel);
         networkManager.sendMineCommand(hit.voxel.x, hit.voxel.y, hit.voxel.z);
+        console.log('[Main] MINE command sent for', hit.voxel.x, hit.voxel.y, hit.voxel.z);
       }
       else if (event.button === 2) { // Right mouse button (for placing)
         const placePosition = new THREE.Vector3().copy(hit.voxel).add(hit.normal);

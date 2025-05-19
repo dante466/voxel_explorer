@@ -30,6 +30,7 @@ export interface PlayerMovementInputState {
   keys: { [key: string]: boolean }; // Key states relevant for movement (W,A,S,D,Space,Shift)
   chunkManager: ChunkManager;
   getIsOnGround: () => boolean;
+  autoStepEnabled: boolean; // ADDED: Flag for auto-step
 }
 
 // Interface for the output state from the movement calculation logic
@@ -49,7 +50,8 @@ export function calculatePlayerMovement(input: PlayerMovementInputState): Player
     cameraYaw, 
     keys, 
     chunkManager,
-    getIsOnGround
+    getIsOnGround,
+    autoStepEnabled // Destructured here
   } = input;
   
   const newPos = currentPosition.clone(); // newPos will be modified for X, Z, and then Y.
@@ -109,14 +111,14 @@ export function calculatePlayerMovement(input: PlayerMovementInputState): Player
     // No gravity or complex Y velocity changes in flying mode for now.
   } else { // Grounded movement physics
     // newPos.y is implicitly currentPosition.y here to start grounded physics calculations for the tick.
-    const isOnGroundForThisTick = input.getIsOnGround(); // Corrected: Use input.getIsOnGround()
+    const isOnGroundForThisTick = getIsOnGround(); // CORRECT: getIsOnGround is from input, already destructured
 
     // 1. Determine baseline terrain interaction points based on new XZ (used for final sticking)
     const yOfHighestBlockBeneath = chunkManager.getHeightAtPosition(newPos.x, newPos.z);
     let targetPlayerYOnGroundFromHeightAt: number | null = null;
     if (yOfHighestBlockBeneath !== null) {
       // Assuming yOfHighestBlockBeneath is Y_of_block, surface is Y_of_block + 0.5 (experiment)
-      const actualGroundSurfaceY = yOfHighestBlockBeneath + 0.5; 
+      const actualGroundSurfaceY = yOfHighestBlockBeneath + 1; // Changed from + 0.5
       targetPlayerYOnGroundFromHeightAt = actualGroundSurfaceY + CLIENT_PLAYER_HALF_HEIGHT;
     }
     // console.log(`[PMS CalcMove] Inputs: newPos.xz(${newPos.x.toFixed(2)}, ${newPos.z.toFixed(2)}), yOfBlockBeneath: ${yOfHighestBlockBeneath}, targetPlayerYOnGroundFromHeightAt: ${targetPlayerYOnGroundFromHeightAt?.toFixed(2)}`);
@@ -132,10 +134,10 @@ export function calculatePlayerMovement(input: PlayerMovementInputState): Player
 
     // 3. Triage Kit 2-B: Ground-snap logic
     let snappedToGroundThisTick = false;
-    if (!didJumpThisTick && currentYVelocity <= 0.0 && isOnGroundForThisTick) { // NEW: Added isOnGroundForThisTick
+    if (autoStepEnabled && !didJumpThisTick && currentYVelocity <= 0.0 && isOnGroundForThisTick) { // CORRECT: autoStepEnabled is from input, already destructured
       const playerCapsuleBottomYForSnap = currentPosition.y - CLIENT_PLAYER_HALF_HEIGHT;
       const highestFootprintSurfaceY = getHighestGroundSurfaceInFootprint(currentPosition, chunkManager, playerCapsuleBottomYForSnap);
-      console.log(`[PMS CalcMove SnapAttempt] curPos: ${currentPosition.y.toFixed(2)}, capBottomForSnap: ${playerCapsuleBottomYForSnap.toFixed(2)}, highestFootprintSurfaceY: ${highestFootprintSurfaceY?.toFixed(2)}`);
+      // console.log(`[PMS CalcMove SnapAttempt] curPos: ${currentPosition.y.toFixed(2)}, capBottomForSnap: ${playerCapsuleBottomYForSnap.toFixed(2)}, highestFootprintSurfaceY: ${highestFootprintSurfaceY?.toFixed(2)}`);
 
       if (highestFootprintSurfaceY !== null) {
         const playerFeetY = currentPosition.y - CLIENT_PLAYER_HALF_HEIGHT;
@@ -177,7 +179,7 @@ export function calculatePlayerMovement(input: PlayerMovementInputState): Player
     finalNewPosition = newPos; // If flying, use the position determined by velocity application directly
   } else {
     // If not flying, apply AABB voxel collision detection and resolution
-    finalNewPosition = resolveAABBvoxelCollision(newPos, chunkManager);
+    finalNewPosition = resolveAABBvoxelCollision(newPos, chunkManager, autoStepEnabled);
   }
 
   // The horizontalVelocity in output state is the new hVel for the next frame
@@ -196,7 +198,7 @@ function getHighestGroundSurfaceInFootprint(
   const floorPlayerZ = Math.floor(centerPos.z);
   let foundGround = false;
   // Log inputs to getHighestGroundSurfaceInFootprint
-  console.log(`[PMS GetHighestSurf] centerPos: (${centerPos.x.toFixed(2)}, ${centerPos.y.toFixed(2)}, ${centerPos.z.toFixed(2)}), playerCapsuleBottomY: ${playerCapsuleBottomY.toFixed(2)}`);
+  // console.log(`[PMS GetHighestSurf] centerPos: (${centerPos.x.toFixed(2)}, ${centerPos.y.toFixed(2)}, ${centerPos.z.toFixed(2)}), playerCapsuleBottomY: ${playerCapsuleBottomY.toFixed(2)}`);
 
   for (let dx = -1; dx <= 1; dx++) { // Check 3x3 columns
     for (let dz = -1; dz <= 1; dz++) {
@@ -207,12 +209,12 @@ function getHighestGroundSurfaceInFootprint(
       for (let scanY = Math.floor(playerCapsuleBottomY + 1); scanY >= 0; scanY--) {
         const blockId = getBlockIdAtWorldPosFromPMS(chunkManager, voxelX, scanY, voxelZ); // Use local helper
         if (blockId > 0) { // If solid
-          const topOfBlockSurfaceY = scanY + 0.5; // Surface is Y_of_block + 0.5 (experiment)
+          const topOfBlockSurfaceY = scanY + 1; // Changed from + 0.5 // Surface is Y_of_block + 0.5 (experiment)
           if (topOfBlockSurfaceY > maxGroundSurfaceY) {
             maxGroundSurfaceY = topOfBlockSurfaceY;
             foundGround = true;
             // Log when a new maxGroundSurfaceY is found
-            console.log(`[PMS GetHighestSurf] Found block at (${voxelX}, ${scanY}, ${voxelZ}), new maxGroundSurfaceY (mid of block): ${maxGroundSurfaceY}`);
+            // console.log(`[PMS GetHighestSurf] Found block at (${voxelX}, ${scanY}, ${voxelZ}), new maxGroundSurfaceY (mid of block): ${maxGroundSurfaceY}`);
           }
           break; // Found highest solid in this column
         }
@@ -249,6 +251,7 @@ export interface PlayerMovementSystemControls {
   getCurrentYVelocity: () => number;
   getCurrentHorizontalVelocity: () => THREE.Vector2; // C1-1: Added
   getKeyStates: () => { [key: string]: boolean }; 
+  getAutoStepState: () => boolean; // ADDED
 }
 
 const keyStates: { [key: string]: boolean } = {};
@@ -257,7 +260,8 @@ export function createPlayerMovementSystem(
   world: IWorld,
   playerEntityId: number,
   gameDocument: Document,
-  chunkManager: ChunkManager
+  chunkManager: ChunkManager,
+  getAutoStepState: () => boolean // ADDED: Getter for auto-step
 ): PlayerMovementSystemControls {
   let currentIsFlying = false;
   let yVelocity = 0;
@@ -323,6 +327,7 @@ export function createPlayerMovementSystem(
         // Triage Kit 1-B: Align ground-check epsilons (e.g. 0.15m for snap tolerance)
         return Math.abs(currentPositionVec.y - calculatedTargetCenterY) < 0.15;
       },
+      autoStepEnabled: getAutoStepState() // ADDED: Use getter for autoStepEnabled
     };
 
     const outputState = calculatePlayerMovement(inputState);
@@ -409,5 +414,6 @@ export function createPlayerMovementSystem(
     getCurrentYVelocity,
     getCurrentHorizontalVelocity: () => horizontalVelocity.clone(), // C1-1: Expose hVel
     getKeyStates: () => ({ ...keyStates }),
+    getAutoStepState, // ADDED
   };
 } 

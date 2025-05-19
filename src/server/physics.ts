@@ -9,20 +9,40 @@ export interface PhysicsWorld {
   removeCollider(collider: RAPIER.Collider): void;
 }
 
-let rapier: typeof RAPIER;
+let rapierInitialized = false;
 
 export async function initRapier() {
-  if (!rapier) {
-    await RAPIER.init();
-    rapier = RAPIER;
+  if (rapierInitialized) {
+    console.log('[Physics] Rapier already initialized.');
+    return;
   }
-  return rapier;
+  try {
+    console.log('[Physics] Initializing Rapier...');
+    await RAPIER.init();
+    rapierInitialized = true;
+    console.log('[Physics] Rapier initialized SUCCESSFULLY.');
+    if (RAPIER.version) {
+      console.log(`[Physics] Rapier version: ${RAPIER.version()}`);
+    } else {
+      console.log('[Physics] RAPIER module loaded (version method not found, but init completed).');
+  }
+  } catch (error) {
+    console.error('[Physics CRITICAL] Failed to initialize Rapier:', error);
+    rapierInitialized = false;
+    throw error;
+  }
 }
 
 export function createPhysicsWorld(): PhysicsWorld {
+  if (!rapierInitialized) {
+    console.error('[Physics CRITICAL] Attempted to create physics world before Rapier was initialized! This should not happen.');
+    throw new Error("Rapier not initialized. Cannot create physics world.");
+  }
+  console.log('[Physics] Creating new Rapier World...');
   const gravity = { x: 0.0, y: -9.81, z: 0.0 };
-  const world = new rapier.World(gravity);
+  const world = new RAPIER.World(gravity);
   world.integrationParameters.dt = 1.0 / 30.0;
+  console.log(`[Physics] New Rapier World created. World object: ${world ? 'Exists' : 'null'}. Gravity: ${world?.gravity?.y}`);
 
   return {
     raw: world,
